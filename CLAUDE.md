@@ -197,6 +197,7 @@ python3 experiments/exp27_ossicle_array_thermal.py
 | Fluctuation theorem | ✓ **Works** | R²=0.95, Crooks relation |
 | **Variance thermal sensing** | ✓ **Works** | r=-0.97 with GPU temperature |
 | **r_ab sensitivity regime** | ✓ **Works** | r=-0.999 predicts sensitivity |
+| **Coupling optimization** | ✓ **Works** | ε=0.003 optimal (τ=12.8s, 562x signal) |
 | k_eff thermal sensing | ✗ **NOT VALIDATED** | r=0.01 (no correlation) |
 | Cross-device sensing | ✗ **NOT VALIDATED** | Algorithmic artifact (see below) |
 | Cross-device transmission | ✗ **NOT VALIDATED** | Startup transient artifact |
@@ -275,6 +276,24 @@ Added to sentinel:
 - `get_sensitivity_regime()`: Returns regime, r_ab, sensitivity multiplier
 - `step_and_measure_full()`: Returns full state including r_ab
 - r_ab-based auto-reset (preferred over time-based)
+
+**COUPLING STRENGTH OPTIMIZATION - CONFIRMED (Exp 43)**
+
+Coupling sweep found optimal operating point at ε = 0.003:
+
+| ε | τ (s) | % Transient | k_eff σ | Behavior |
+|---|-------|-------------|---------|----------|
+| 0.0003 | N/A | 100% | 0.03 | Never thermalizes |
+| **0.003** | **12.8** | **64%** | **0.75** | **OPTIMAL** |
+| 0.01 | 3.7 | 19% | 1.61 | Fast thermalization |
+| 0.05 | 0.7 | 4% | 3.14 | Near-instant |
+
+Scaling law: τ ∝ ε^(-1.06)
+
+FFT comparison (exp42):
+- Old default (ε=0.0003): TRANSIENT variance = 0.0012
+- New default (ε=0.003): TRANSIENT variance = 0.67 → **562x improvement**
+- THERMALIZED variance ≈ 0 (confirms sensitivity in transient regime only)
 
 ### Methodological Lessons
 

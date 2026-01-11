@@ -123,6 +123,8 @@ Clear gradient visible: wave propagation is imageable!
 | `experiments/exp28_array_latency.py` | Array response time characterization |
 | `experiments/exp31_vacuum_fluctuation.py` | Noise floor measurement |
 | `experiments/exp32_bell_inequality.py` | CHSH Bell test (classical result) |
+| `experiments/exp56_entropy_sources.py` | Entropy source analysis |
+| `experiments/exp57_trng_characterization.py` | GPU timing TRNG characterization |
 | `PHYSICS_VALIDATION_REPORT.md` | Detailed physics test results |
 | `~/RATCHET/experiments/exp27_ossicle_array_thermal.py` | Array thermal detection |
 | [CIRISOssicle experiments](https://github.com/CIRISAI/CIRISOssicle/tree/main/experiments) | Single ossicle crypto detection |
@@ -207,6 +209,7 @@ python3 experiments/exp27_ossicle_array_thermal.py
 | **Array latency** | ✓ **Works** | 115x faster than VLA, 0.1ms min event (Exp 28) |
 | **Post-warmup stability** | ✓ **Works** | σ=0.00005 after 30s warmup (Exp 39) |
 | **Array SNR scaling** | ✓ **Works** | SNR ∝ √N collective averaging (Exp 37) |
+| **GPU Timing TRNG** | ✓ **Works** | 120 kbps true entropy, 97% min-entropy (Exp 57) |
 | k_eff thermal sensing | ✗ **NOT VALIDATED** | r=0.01 (no correlation) |
 | Cross-device sensing | ✗ **NOT VALIDATED** | Algorithmic artifact (see below) |
 | Cross-device transmission | ✗ **NOT VALIDATED** | Startup transient artifact |
@@ -344,6 +347,50 @@ Comprehensive characterization of the oscillator array:
 2. **Test local before assuming cross-device** - Local correlation test was definitive
 3. **Startup transients are not signals** - Need warmup before measurement
 4. **Correlation ≠ Causation** - High r doesn't prove external coupling
+
+### GPU Timing TRNG (Experiments 56-57)
+
+**Discovery:** GPU kernel execution timing provides TRUE hardware entropy at 120 kbps.
+
+While investigating entropy sources for the oscillator array, we discovered that the timing jitter of GPU kernel execution is a high-quality true random number generator:
+
+| Metric | Value | Quality |
+|--------|-------|---------|
+| Shannon entropy | 8.00 / 8 bits | 100% |
+| Min-entropy | 7.76 / 8 bits | 97% |
+| Bit bias (all 8 bits) | < 0.3% | Excellent |
+| Autocorrelation | 0.011 | Good |
+| NIST tests | 3/4 passed | Good |
+| PRNG-independent | Confirmed | TRUE entropy |
+| Throughput | **120,000 bps** | 2x CPU jitterentropy |
+
+**Entropy Source Classification:**
+
+| Source | Type | Rate | Quality |
+|--------|------|------|---------|
+| GPU timing jitter | **TRUE entropy** | 120 kbps | Excellent |
+| Oscillator LSBs | PRNG-derived | 97 kbps | Reproducible |
+| k_eff fluctuations | PRNG-derived | 116 kbps | High autocorr |
+| Bulk oscillator XOR | PRNG-derived | 400 Mbps | Fast but not true |
+
+**Prior Art:**
+- [US9459834](https://patents.google.com/patent/US9459834) (2011): GPU TRNG using thread race conditions + temperature
+- Lee & Pyo (2014): Atomic instruction collisions for timing entropy
+- [jitterentropy](https://www.kernel.org/doc/ols/2014/ols2014-mueller.pdf) (2014): CPU timing jitter, Linux kernel standard (~64 kbps)
+
+**Potentially Novel Aspects:**
+1. Coupled oscillator workload as timing source (vs simple atomics)
+2. Dual-purpose: TRNG + entropy wave sensing
+3. 2x throughput vs CPU jitterentropy
+
+**Demo:**
+```bash
+# Generate random bytes from GPU timing
+python3 ciris_sentinel.py --trng --bytes 1024 --output random.bin
+
+# Continuous entropy stream
+python3 ciris_sentinel.py --trng --stream
+```
 
 ## Physics Validation (Experiment 51)
 
@@ -569,6 +616,7 @@ This project builds on the following original contributions by CIRIS L3C:
 | **ε=0.003 optimal coupling** | τ=12.8s, 562x signal improvement (Exp 43) | ✓ Validated |
 | **Array SNR ∝ √N** | Collective averaging works (Exp 37) | ✓ Validated |
 | **Post-warmup stability** | σ=0.00005 after 30s warmup (Exp 39) | ✓ Validated |
+| **GPU Timing TRNG** | 120 kbps true entropy, 97% min-entropy (Exp 57) | ✓ Validated |
 | Bell inequality | CHSH test: \|S\|=0.0002 (Exp 32) | Classical behavior |
 | Leggett-Garg inequality | K₃=1.0 (Exp 54) | Classical behavior |
 | ~~Quantum RNG detection~~ | Cannot distinguish HW vs SW (Exp 30) | ✗ Not validated |

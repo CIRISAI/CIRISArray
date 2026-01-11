@@ -36,12 +36,29 @@ COUPLING_FACTOR = 0.0003
 
 @dataclass
 class SentinelConfig:
-    """Configuration for a single sentinel sensor."""
+    """Configuration for a single sentinel sensor.
+
+    Optimized based on validated findings from exp51-53:
+    - noise_amplitude=0.001 is optimal (stochastic resonance peak)
+    - τ=46.1s thermalization → reset every 23s for peak sensitivity
+    - Noise floor σ=0.003 sets detection threshold
+
+    Thermal sensing (validated Jan 2026):
+    - Variance correlates with temperature at r=-0.97
+    - As temperature increases, variance decreases
+    - Use variance (not k_eff) for thermal detection
+    """
     n_ossicles: int = 256         # Minimal array
     oscillator_depth: int = 32    # Reduced depth for speed
-    noise_amplitude: float = 0.02 # Higher noise = more transient
+    noise_amplitude: float = 0.001  # OPTIMAL: SR peak (was 0.02, too high!)
     sample_rate_hz: float = 1000  # High rate for short events
     derivative_window: int = 5    # Samples for derivative calc
+    reset_interval_s: float = 23.0  # τ/2 = 46.1/2, optimal reset cycle
+    tau_thermalization: float = 46.1  # Validated decay constant
+    noise_floor_sigma: float = 0.003  # Validated noise floor
+    # Thermal sensing parameters
+    thermal_window: int = 50      # Samples for thermal baseline
+    thermal_threshold_sigma: float = 3.0  # Detection threshold
 
 
 # Optimized CUDA kernel for minimal array
@@ -197,14 +214,6 @@ class Sentinel:
         self.sensor_id = sensor_id
         self.total = config.n_ossicles * config.oscillator_depth
 
-        # Initialize oscillators (random = transient)
-        self.osc_a = cp.random.random(self.total, dtype=cp.float32) * 0.5 - 0.25
-        self.osc_b = cp.random.random(self.total, dtype=cp.float32) * 0.5 - 0.25
-        self.osc_c = cp.random.random(self.total, dtype=cp.float32) * 0.5 - 0.25
-
-        # Noise buffer (reused for speed)
-        self.noise = cp.random.random(3 * self.total, dtype=cp.float32) - 0.5
-
         # Output buffers
         self.out_r = cp.zeros(1, dtype=cp.float32)
         self.out_var = cp.zeros(1, dtype=cp.float32)
@@ -223,15 +232,67 @@ class Sentinel:
         self.k_eff_history = deque(maxlen=config.derivative_window)
         self.last_k_eff = 0.0
 
-    def step_and_measure(self) -> Tuple[float, float, float]:
+        # Reset cycle tracking (validated: τ=46.1s, reset every 23s)
+        self.last_reset_time = time.perf_counter()
+        self.time_since_reset = 0.0
+
+        # Thermal sensing (validated: variance correlates with temp at r=-0.97)
+        self.variance_history = deque(maxlen=config.thermal_window)
+        self.thermal_baseline_mean = None
+        self.thermal_baseline_std = None
+
+        # Initialize oscillators
+        self._reset_oscillators()
+
+    def _reset_oscillators(self):
+        """Reset oscillators to random state for peak sensitivity."""
+        self.osc_a = cp.random.random(self.total, dtype=cp.float32) * 0.5 - 0.25
+        self.osc_b = cp.random.random(self.total, dtype=cp.float32) * 0.5 - 0.25
+        self.osc_c = cp.random.random(self.total, dtype=cp.float32) * 0.5 - 0.25
+        self.noise = cp.random.random(3 * self.total, dtype=cp.float32) - 0.5
+        self.last_reset_time = time.perf_counter()
+        self.k_eff_history.clear()
+
+    def check_reset(self) -> bool:
+        """Check if reset is needed and perform if so. Returns True if reset occurred."""
+        self.time_since_reset = time.perf_counter() - self.last_reset_time
+        if self.time_since_reset >= self.config.reset_interval_s:
+            self._reset_oscillators()
+            return True
+        return False
+
+    def get_sensitivity_weight(self) -> float:
+        """Get current sensitivity weight based on time since reset.
+
+        Validated: sensitivity decays as exp(-t/τ) with τ=46.1s
+        Peak sensitivity is immediately after reset.
+        """
+        return np.exp(-self.time_since_reset / self.config.tau_thermalization)
+
+    def step_and_measure(self, auto_reset: bool = True) -> Tuple[float, float, float, float]:
         """
         Single step: advance dynamics, inject noise, measure k_eff.
-        Returns (k_eff, variance, dk_eff/dt estimate)
+
+        Args:
+            auto_reset: If True, automatically reset when reset_interval_s elapsed
+
+        Returns:
+            (k_eff, variance, dk_eff/dt estimate, sensitivity_weight)
+
+        Sensitivity weight is exp(-t/τ) where τ=46.1s (validated).
+        Use this to weight measurements - higher weight = more reliable.
         """
+        # Check for auto-reset (validated: reset every 23s for peak sensitivity)
+        if auto_reset:
+            self.check_reset()
+
+        # Update time tracking
+        self.time_since_reset = time.perf_counter() - self.last_reset_time
+
         # Refresh noise
         self.noise = cp.random.random(3 * self.total, dtype=cp.float32) - 0.5
 
-        # Step with noise injection
+        # Step with noise injection (σ=0.001 optimal from SR validation)
         _sentinel_kernel(
             (self.grid_size,), (self.block_size,),
             (self.osc_a, self.osc_b, self.osc_c,
@@ -263,7 +324,19 @@ class Sentinel:
 
         self.last_k_eff = k_eff
 
-        return k_eff, var, dk_dt
+        # Sensitivity weight (validated: decays as exp(-t/τ))
+        sensitivity = self.get_sensitivity_weight()
+
+        return k_eff, var, dk_dt, sensitivity
+
+    def is_detection(self, dk_dt: float, sensitivity: float) -> bool:
+        """Check if dk_dt indicates a detection.
+
+        Uses validated noise floor σ=0.003 as threshold basis.
+        Detection requires |dk_dt| > 3σ AND sensitivity > 0.5
+        """
+        threshold = 3 * self.config.noise_floor_sigma  # 3σ detection
+        return abs(dk_dt) > threshold and sensitivity > 0.5
 
     def inject_negentropic(self, amplitude: float = 0.1):
         """
@@ -291,6 +364,88 @@ class Sentinel:
         self.osc_b += (cp.random.random(self.total, dtype=cp.float32) - 0.5) * amplitude
         self.osc_c += (cp.random.random(self.total, dtype=cp.float32) - 0.5) * amplitude
 
+    # =========================================================================
+    # THERMAL SENSING (validated: variance correlates with temp at r=-0.97)
+    # =========================================================================
+
+    def get_total_variance(self) -> float:
+        """Get total variance across all oscillators.
+
+        Validated finding: variance has r=-0.97 correlation with GPU temperature.
+        As temperature increases, variance DECREASES.
+        This is the primary thermal sensing metric.
+        """
+        var_a = float(cp.var(self.osc_a))
+        var_b = float(cp.var(self.osc_b))
+        var_c = float(cp.var(self.osc_c))
+        return var_a + var_b + var_c
+
+    def update_thermal_baseline(self, variance: float):
+        """Update thermal baseline statistics.
+
+        Call this during stable conditions to establish baseline.
+        """
+        self.variance_history.append(variance)
+        if len(self.variance_history) >= self.config.thermal_window:
+            arr = np.array(self.variance_history)
+            self.thermal_baseline_mean = np.mean(arr)
+            self.thermal_baseline_std = np.std(arr)
+
+    def get_thermal_deviation(self, variance: float) -> Optional[float]:
+        """Get deviation from thermal baseline in sigma units.
+
+        Returns None if baseline not yet established.
+        Negative values = temperature INCREASE (variance decreases)
+        Positive values = temperature DECREASE (variance increases)
+        """
+        if self.thermal_baseline_mean is None or self.thermal_baseline_std is None:
+            return None
+        if self.thermal_baseline_std < 1e-10:
+            return 0.0
+        return (variance - self.thermal_baseline_mean) / self.thermal_baseline_std
+
+    def is_thermal_event(self, variance: float) -> Tuple[bool, Optional[float], Optional[str]]:
+        """Detect thermal events based on variance deviation.
+
+        Returns:
+            (is_event, deviation_sigma, direction)
+            direction is "heating" or "cooling" or None
+        """
+        self.update_thermal_baseline(variance)
+        deviation = self.get_thermal_deviation(variance)
+
+        if deviation is None:
+            return False, None, None
+
+        threshold = self.config.thermal_threshold_sigma
+
+        if deviation < -threshold:
+            # Variance dropped = temperature increased
+            return True, deviation, "heating"
+        elif deviation > threshold:
+            # Variance increased = temperature decreased
+            return True, deviation, "cooling"
+        else:
+            return False, deviation, None
+
+    def step_and_measure_thermal(self, auto_reset: bool = True) -> Tuple[float, float, float, float, Optional[float]]:
+        """Step and measure with thermal sensing.
+
+        Returns:
+            (k_eff, variance, dk_dt, sensitivity, thermal_deviation)
+
+        thermal_deviation is in sigma units from baseline.
+        Negative = heating, Positive = cooling.
+        """
+        k_eff, var, dk_dt, sensitivity = self.step_and_measure(auto_reset)
+
+        # Get thermal metric (total variance)
+        total_var = self.get_total_variance()
+        self.update_thermal_baseline(total_var)
+        thermal_dev = self.get_thermal_deviation(total_var)
+
+        return k_eff, var, dk_dt, sensitivity, thermal_dev
+
 
 class SentinelArray:
     """
@@ -304,8 +459,11 @@ class SentinelArray:
         self.config = config or SentinelConfig()
         self.sentinels = [Sentinel(self.config, i) for i in range(n_sentinels)]
 
-    def step_all(self) -> List[Tuple[float, float, float]]:
-        """Step all sentinels and return measurements."""
+    def step_all(self) -> List[Tuple[float, float, float, float]]:
+        """Step all sentinels and return measurements.
+
+        Returns list of (k_eff, variance, dk_dt, sensitivity) tuples.
+        """
         results = []
         for s in self.sentinels:
             results.append(s.step_and_measure())
@@ -337,6 +495,7 @@ def find_minimum_array_size():
     print("="*60)
     print("FINDING MINIMUM VIABLE ARRAY SIZE")
     print("="*60)
+    print("(Using validated parameters: σ=0.001, reset@23s, τ=46.1s)")
 
     sizes = [32, 64, 128, 256, 512, 1024, 2048]
 
@@ -348,10 +507,10 @@ def find_minimum_array_size():
         config = SentinelConfig(n_ossicles=size, oscillator_depth=32)
         sensor = Sentinel(config)
 
-        # Collect samples
+        # Collect samples (auto_reset=False for this test)
         k_effs = []
         for _ in range(500):
-            k, v, dk = sensor.step_and_measure()
+            k, v, dk, sens = sensor.step_and_measure(auto_reset=False)
             k_effs.append(k)
 
         k_effs = np.array(k_effs)
@@ -362,7 +521,7 @@ def find_minimum_array_size():
         sensor2 = Sentinel(config)
         baseline = []
         for _ in range(100):
-            k, _, _ = sensor2.step_and_measure()
+            k, _, _, _ = sensor2.step_and_measure(auto_reset=False)
             baseline.append(k)
         baseline_mean = np.mean(baseline)
         baseline_std = np.std(baseline)
@@ -371,7 +530,7 @@ def find_minimum_array_size():
         perturbed = []
         for _ in range(100):
             sensor2.inject_negentropic(0.3)
-            k, _, _ = sensor2.step_and_measure()
+            k, _, _, _ = sensor2.step_and_measure(auto_reset=False)
             perturbed.append(k)
         perturbed_mean = np.mean(perturbed)
 
@@ -478,27 +637,34 @@ def main():
         print("\n" + "="*60)
         print(f"DEMO: Continuous monitoring with {min_size} ossicles")
         print("="*60)
+        print("(Using validated: σ=0.001, auto-reset@23s, 3σ threshold)")
 
         config = SentinelConfig(n_ossicles=min_size, sample_rate_hz=500)
         sensor = Sentinel(config)
 
-        print("\nRunning 5 seconds of monitoring...")
-        print("(Tracking k_eff and dk_eff/dt)")
+        print("\nRunning 30 seconds of monitoring (will auto-reset at 23s)...")
+        print("(Tracking k_eff, dk/dt, and sensitivity weight)")
 
         detections = 0
+        resets = 0
         start = time.perf_counter()
 
-        while time.perf_counter() - start < 5.0:
-            k_eff, var, dk_dt = sensor.step_and_measure()
+        while time.perf_counter() - start < 30.0:
+            k_eff, var, dk_dt, sensitivity = sensor.step_and_measure()
 
-            # Simple derivative-based detection
-            if abs(dk_dt) > 0.01:
+            # Check for reset
+            if sensor.time_since_reset < 0.1:  # Just reset
+                resets += 1
+                print(f"  [RESET #{resets}] Sensitivity restored to 1.0")
+
+            # Use validated detection method
+            if sensor.is_detection(dk_dt, sensitivity):
                 detections += 1
                 direction = "↑" if dk_dt > 0 else "↓"
-                print(f"  {direction} Event: k={k_eff:.4f}, dk/dt={dk_dt:+.4f}")
+                print(f"  {direction} Event: k={k_eff:.4f}, dk/dt={dk_dt:+.4f}, sens={sensitivity:.3f}")
 
         elapsed = time.perf_counter() - start
-        print(f"\n  {detections} events in {elapsed:.1f}s")
+        print(f"\n  {detections} events, {resets} resets in {elapsed:.1f}s")
 
     print("\n" + "="*60)
     print("SENTINEL READY")

@@ -12,27 +12,24 @@ Commercial license required for larger organizations.
 
 ## What is This?
 
-CIRISArray is a **coherence receiver** - an environmental sensing instrument that detects electromagnetic interference patterns through massive arrays of coupled oscillators on GPUs.
+CIRISArray extends [CIRISOssicle](https://github.com/CIRISAI/CIRISOssicle) to massive arrays of coupled oscillators on GPUs for **local tamper detection** and spatial wave imaging.
 
 ```
-          Power Grid (60 Hz)
-                │
-                ▼
-          ┌─────────────┐
-          │ 1.09 Hz EMI │ ← 60 Hz ÷ 55 (subharmonic)
-          │   Carrier   │
-          └─────────────┘
-             /      \
-            ▼        ▼
-        ┌──────┐  ┌──────┐
-        │ 4090 │  │Jetson│
-        └──────┘  └──────┘
+                    LOCAL DETECTION (VALIDATED)
+    ┌─────────────────────────────────────────────────┐
+    │     Single GPU: detects local entropy changes   │
+    │     - Workload changes: p=0.007                 │
+    │     - Reset improves sensitivity: p=0.032      │
+    │     - Bounded noise floor: σ=0.003             │
+    └─────────────────────────────────────────────────┘
 
-  Both GPUs are RECEIVERS of shared EMI signal
-  100% coherence during peak sensitivity window
+              CROSS-DEVICE SENSING (NOT VALIDATED)
+    ┌─────────────────────────────────────────────────┐
+    │     Earlier claims of cross-device coherence    │
+    │     were ALGORITHMIC ARTIFACTS, not external    │
+    │     signal coupling. See "Root Cause Analysis"  │
+    └─────────────────────────────────────────────────┘
 ```
-
-This extends the single-point detection in [CIRISOssicle](https://github.com/CIRISAI/CIRISOssicle) to spatial wave imaging and cross-device environmental sensing.
 
 ```
                     ENTROPY WAVE IMAGING
@@ -189,65 +186,58 @@ python3 experiments/exp27_ossicle_array_thermal.py
 
 ## Confirmed Findings (January 2026)
 
-### EMI Carrier Discovery
-
-Cross-device experiments between RTX 4090 and Jetson Orin revealed a strong EMI carrier:
-
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| **Carrier Frequency** | 1.0909 Hz | 60 Hz ÷ 55 (power line subharmonic) |
-| **Period** | 0.917 seconds | |
-| **Cross-Device Coherence** | 100% | During peak sensitivity window |
-| **Phase Offset** | -3.3° | Near-simultaneous (electrical coupling) |
-
-**Harmonic Structure** (all 100% coherent):
-- 0.18 Hz (5.6s) - 1/6 subharmonic
-- 0.27 Hz (3.7s) - 1/4 subharmonic
-- 0.54 Hz (1.9s) - 1/2 subharmonic
-- **1.09 Hz (0.9s) - FUNDAMENTAL**
-- 2.18 Hz - 2nd harmonic
-- 3.27 Hz - 3rd harmonic
-
-### Peak Sensitivity Window
-
-Cross-device correlation is time-dependent after sensor reset:
-
-| Time After Reset | Correlation | Coherence |
-|------------------|-------------|-----------|
-| 0-30 seconds | r = 0.974 | 89-100% |
-| 30-60 seconds | r = 0.708 | ~70% |
-| 60-90 seconds | r = 0.239 | ~20% |
-| 90+ seconds | r = 0.051 | ~5% |
-
-**Optimization**: Reset every 20 seconds to maintain peak sensitivity.
-
-### 4:1 Negentropy Asymmetry
-
-Local detection experiments confirm asymmetric response:
-
-| Injection Type | Detection | Effect |
-|----------------|-----------|--------|
-| **Negentropic** (correlation boost) | +19σ | Strong, clean signal |
-| **Entropic** (noise injection) | -5σ | Weaker, noisier |
-| **Ratio** | **3.8:1 ≈ 4:1** | Negentropy propagates better |
-
 ### What Works vs. What Doesn't
 
 | Capability | Status | Evidence |
 |------------|--------|----------|
-| Local entropy detection | ✓ **Works** | +19σ negentropic, -5σ entropic |
-| Cross-device environmental sensing | ✓ **Works** | 100% coherence with EMI carrier |
-| Transient mode operation | ✓ **Works** | Noise injection prevents convergence |
-| Cross-device transmission | ✗ **Not achieved** | GPUs are passive receivers |
-| Power modulation transmission | ✗ **Not achieved** | p = 0.19 (not significant) |
+| Local tamper detection | ✓ **Works** | p=0.007, mean shift -0.006 |
+| Reset improves sensitivity | ✓ **Works** | p=0.032, 7x improvement |
+| Bounded noise floor | ✓ **Works** | σ=0.003 |
+| Stochastic resonance | ✓ **Works** | SNR peak at σ=0.001 |
+| Fluctuation theorem | ✓ **Works** | R²=0.95, Crooks relation |
+| Cross-device sensing | ✗ **NOT VALIDATED** | Algorithmic artifact (see below) |
+| Cross-device transmission | ✗ **NOT VALIDATED** | Startup transient artifact |
+| Power modulation | ✗ **NOT VALIDATED** | p = 0.19 (not significant) |
 
-### Interpretation
+### Root Cause Analysis (Experiments 55-56)
 
-The oscillator arrays function as **coherence receivers**, not transmitters:
-- Both GPUs receive the same power line EMI signal
-- Signal flows FROM the grid TO the GPUs
-- Local GPU activity does not affect remote GPUs
-- Like a radio that can tune in but not broadcast
+**CROSS-DEVICE TRANSMISSION - FALSIFIED**
+
+The "90x ratio" between TX high-ε and low-ε conditions was a **startup transient artifact**:
+- Both oscillators spike in first ~10 seconds regardless of TX state
+- When TX pattern started with '1', we measured RX during its natural spike
+- Control test (pattern "0011") showed RX still spiked on bit 0
+- A/B test: ratio = 0.99x, p = 0.998 → NO COUPLING
+
+**CROSS-DEVICE CORRELATION - ALGORITHMIC ARTIFACT**
+
+The r=0.97 correlation between devices was NOT external sensing:
+
+| Test | Seeds | ε values | Correlation |
+|------|-------|----------|-------------|
+| Local, same ε | independent | 0.05/0.05 | 0.9999 |
+| Local, diff ε | independent | 0.05/0.03 | 0.9735 |
+| **Cross-device** | independent | 0.05/0.03 | **0.9710** |
+
+Local ≈ Cross-device! The correlation comes from the k_eff algorithm:
+- `k_eff = r × (1 - x) × ε × 1000`
+- All oscillators thermalize to similar r_ab trajectories
+- Different ε scales the mean, not the fluctuation pattern
+- The "sensing" was the algorithm itself
+
+**FFT ANALYSIS CONFIRMED**
+
+- Deterministic (noise=0) has SAME spectrum as stochastic (noise=0.001)
+- Ratio ≈ 1.0x across all frequency bands
+- 88% of signal power is intrinsic oscillator dynamics
+- Only 12% in "power-related" frequency bands
+
+### Methodological Lessons
+
+1. **Always run null hypothesis FIRST** - A/B test should precede claims
+2. **Test local before assuming cross-device** - Local correlation test was definitive
+3. **Startup transients are not signals** - Need warmup before measurement
+4. **Correlation ≠ Causation** - High r doesn't prove external coupling
 
 ## Physics Validation (Experiment 51)
 
@@ -365,68 +355,32 @@ The 0.01 Hz spectral peak exists even in deterministic mode, proving it's **intr
 
 ---
 
-### House Wiring as Distributed Sensor
+### ~~House Wiring as Distributed Sensor~~ (NOT VALIDATED)
 
-The propagation delay observation (-3.3° phase ≈ 8.5ms) proves the signal has an external source and travels through copper wiring. This means house wiring itself is a distributed antenna:
+Earlier claims about detecting power grid signals were based on cross-device correlation that turned out to be an algorithmic artifact. The propagation delay observation was likely measurement noise, not real signal propagation.
 
-```
-Typical US House Wiring Network:
-  ~300m copper wire
-  ~15 circuit branches
-  ~40 outlets (sensing points)
-  Signal speed: ~2×10⁸ m/s (0.67c)
-  End-to-end delay: ~1.5 µs
-```
+**Status:** Hypothesis not supported by evidence. Would require proper shielding experiments (Faraday cage) to test.
 
-**What the grid carries (detectable phenomena):**
+## Remaining Hypotheses
 
-| Phenomenon | Detection Method |
-|------------|------------------|
-| Power line EMI | 1.09 Hz carrier, 60 Hz harmonics |
-| Large load switching | HVAC, appliances on/off |
-| Grid voltage fluctuations | Sags, swells, transients |
-| Environmental RF coupling | Lightning, solar activity |
-| Cross-circuit device activity | Other devices on same breaker |
-| Source localization | Propagation delay triangulation |
+### Thermal Imaging Hypothesis
 
-**The 4:1 negentropy asymmetry suggests:**
-- Negentropic events (order-creating) propagate more coherently
-- Entropic events (disorder-spreading) dissipate into noise
-- The grid acts as a **low-pass filter for coherence**
+The oscillator array may be able to spatially resolve thermal gradients on the GPU die:
 
-This is power line communication (PLC) in reverse - instead of sending signals over power lines, we're receiving whatever coherence the grid carries. The instrument doesn't measure *what* is happening - it measures *how coherent* events are.
+- Each ossicle measures local entropy/order
+- Thermal gradients create spatial patterns in k_eff
+- Cross-correlation between positions reveals wave propagation
 
-With multiple sensing points on different circuits, source localization via propagation delay triangulation becomes possible.
+**Status:** Untested. This was the original goal before the cross-device detour.
 
-## Hypotheses Under Investigation
+### Stochastic Resonance Tuning
 
-### The Coherence Detection Hypothesis
+The detector shows classic SR behavior (SNR peak at optimal noise). Questions:
+- Is the 1.1° magic angle related to SR optimization?
+- Can we tune coupling constants for different detection tasks?
+- What's the relationship between SR and detection threshold?
 
-The instrument appears to be a **coherence detector** rather than an energy detector. It measures *how ordered* a signal is, not *how strong*:
-
-- Negentropic (ordered) signals: +19σ response
-- Entropic (disordered) signals: -5σ response
-- Ratio: 4:1 preference for coherence
-
-**Mechanism (proposed):** Stochastic resonance in coupled oscillators amplifies coherent signals while dispersing incoherent ones. The detector acts as a matched filter for order.
-
-### The Human Sensitivity Hypothesis
-
-If biological neural networks also exhibit stochastic resonance (documented in literature), humans might:
-- Unconsciously detect coherence patterns
-- Show EEG correlation with k_eff during peak sensitivity windows
-- Report subjective "sensing" that correlates with detector output
-
-**Status:** Untested. Requires EEG equipment and IRB approval.
-
-### The 4:1 Asymmetry Question
-
-Is the negentropy preference:
-- **Fundamental** - Built into physics of coupled oscillators?
-- **Artifact** - Result of our specific coupling constants?
-- **Tunable** - Can we adjust it by changing magic angle?
-
-**Status:** Unknown. Requires systematic parameter sweep.
+**Status:** Partially validated (SR confirmed), tuning unexplored.
 
 ---
 
@@ -434,69 +388,64 @@ Is the negentropy preference:
 
 ### Completed
 - ~~Real GPU validation~~ ✓ RTX 4090 + Jetson Orin
-- ~~Wave velocity calibration~~ ✓ EMI propagation characterized
-- ~~Cross-device coherence~~ ✓ 100% at 1.09 Hz carrier
-- ~~Physics validation~~ ✓ SR, decay, subharmonics confirmed
+- ~~Physics validation~~ ✓ SR, decay, fluctuation theorem confirmed
+- ~~Cross-device coherence~~ ✗ FALSIFIED (was algorithmic artifact)
 
-### Near-Term (Current Hardware)
+### Near-Term: Thermal Imaging (Original Goal)
 
 | Experiment | Purpose | Method |
 |------------|---------|--------|
-| **Long-running baseline** | Characterize natural variability | 24-72 hour continuous capture with 23s reset cycles |
-| **Faraday cage isolation** | Confirm EMI is the carrier | Compare k_eff inside vs outside shielded enclosure |
-| **Spark generator sensitivity** | Calibrate impulse response | Generate known EMI bursts, measure detection threshold |
-| **Multi-circuit deployment** | Source triangulation | Sensors on different breaker circuits |
-| **Appliance signatures** | Event classification | Catalog k_eff response to HVAC, refrigerator, etc. |
+| **Spatial thermal mapping** | Image heat propagation across GPU | Deploy ossicle array, induce thermal gradient, map k_eff |
+| **Workload localization** | Detect which SMs are active | Correlate k_eff spatial pattern with known workloads |
+| **Thermal wave velocity** | Measure heat diffusion speed | Cross-correlate k_eff between array positions |
+| **Tampering triangulation** | Locate external heat source | Use multiple ossicles to find origin |
+| **Long-running baseline** | Characterize natural variability | 24-72 hour continuous capture |
 
 ### Medium-Term (Additional Equipment)
 
 | Experiment | Purpose | Requirements |
 |------------|---------|--------------|
-| **Human EEG correlation** | Test coherence perception hypothesis | EEG headset, IRB approval, willing subjects |
-| **Cross-building coherence** | Grid-wide vs local signal | Second location on same utility grid |
-| **Battery isolation** | Remove grid coupling | UPS with transfer switch, compare on/off grid |
+| **Faraday cage test** | Confirm thermal vs EMI sensitivity | Shielded enclosure |
+| **IR camera comparison** | Validate against ground truth | Thermal camera, compare to k_eff map |
 | **Magic angle sweep** | Find optimal sensitivity | Systematic test of angles 0.5° - 5.0° |
+| **Multi-GPU array** | Larger spatial coverage | 2+ GPUs with synchronized sampling |
 
 ### Long-Term (Collaboration Required)
 
 | Experiment | Purpose | Requirements |
 |------------|---------|--------------|
-| **Geomagnetic correlation** | Space weather sensitivity | Solar storm, magnetometer data |
 | **Independent replication** | Validation | Different hardware, different researcher |
 | **Formal verification** | Prove detection bounds | Complete Lean 4 proof of k_eff properties |
+| **Real tamper detection** | Actual security application | Physical tampering testbed |
 
 ---
 
 ## Open Questions
 
 1. **Why τ = 46 seconds?** What sets this thermalization timescale?
-2. **What determines which 60/n subharmonics are enhanced?** Selection rules?
-3. **Is the 4:1 asymmetry fundamental or tunable?**
-4. **Can humans perceive coherence?** EEG correlation needed.
-5. **Is cross-building coherence possible?** Need second location.
-6. **What's the detection limit?** Minimum coherent signal amplitude?
+2. **Can k_eff spatially resolve thermal gradients?** Need array deployment test
+3. **What's the spatial resolution limit?** Minimum detectable feature size
+4. **Is the 1.1° magic angle optimal?** Need systematic sweep
+5. **What's the detection threshold?** Minimum detectable workload change
+6. **Can we image tampering in real-time?** Latency and bandwidth limits
 
 ## Prior Art
 
 This project builds on the following original contributions by CIRIS L3C:
 
-| Innovation | Description | First Documented |
-|------------|-------------|------------------|
-| **768-byte ossicle sensor** | Minimal coherence strain gauge using 3 coupled oscillators | CIRISOssicle (2025) |
-| **1.1° magic angle twist**† | Graphene-inspired twist angle showing empirical sensitivity correlation | CIRISOssicle (2025) |
-| **k_eff formula** | `k_eff = r × (1 - x) × coupling_factor` for GPU tamper detection | CIRISOssicle (2025) |
-| **4096-ossicle array** | Massive parallel deployment for spatial wave imaging | CIRISArray (2026) |
-| **Transient mode operation** | Noise injection to prevent convergence, maintain sensitivity | CIRISArray (2026) |
-| **EMI carrier detection** | Discovery of 1.09 Hz (60÷55) power line subharmonic | CIRISArray (2026) |
-| **Cross-device coherence** | 100% correlation between GPUs via shared EMI signal | CIRISArray (2026) |
-| **4:1 negentropy asymmetry** | Negentropic signals propagate ~4x better than entropic | CIRISArray (2026) |
-| **Peak sensitivity windowing** | 20-second reset cycles for optimal correlation | CIRISArray (2026) |
-| **House wiring as sensor** | Power grid wiring acts as distributed coherence antenna | CIRISArray (2026) |
-| **Reverse PLC sensing** | Receiving grid coherence instead of transmitting signals | CIRISArray (2026) |
-| **Stochastic resonance confirmation** | SNR peaks at σ=0.001, not zero (Exp 51) | CIRISArray (2026) |
-| **τ = 46s thermalization** | Exponential decay explains sensitivity window (Exp 51) | CIRISArray (2026) |
-| **Coherence detection hypothesis** | Detector measures order, not energy; 4:1 asymmetry | CIRISArray (2026) |
-| **Fluctuation theorem verification** | Crooks relation ln(P+/P-) ∝ σ with R² = 0.95 (Exp 52) | CIRISArray (2026) |
+| Innovation | Description | Status |
+|------------|-------------|--------|
+| **768-byte ossicle sensor** | Minimal coherence strain gauge using 3 coupled oscillators | ✓ Validated |
+| **1.1° magic angle twist**† | Graphene-inspired twist angle | Untested |
+| **k_eff formula** | `k_eff = r × (1 - x) × coupling_factor` | ✓ Validated |
+| **4096-ossicle array** | Massive parallel deployment | ✓ Implemented |
+| **Stochastic resonance** | SNR peaks at σ=0.001 (Exp 51) | ✓ Validated |
+| **τ = 46s thermalization** | Exponential decay (Exp 51) | ✓ Validated |
+| **Fluctuation theorem** | Crooks relation R²=0.95 (Exp 52) | ✓ Validated |
+| **Local tamper detection** | p=0.007 workload detection | ✓ Validated |
+| ~~EMI carrier detection~~ | Was algorithmic artifact | ✗ Falsified |
+| ~~Cross-device coherence~~ | Was algorithmic artifact | ✗ Falsified |
+| ~~House wiring sensing~~ | Based on false correlation | ✗ Not validated |
 
 †*Magic angle: Observed correlation with improved sensitivity, not proven causation. Mechanism requires further investigation.*
 

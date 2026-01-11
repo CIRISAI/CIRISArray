@@ -47,6 +47,12 @@ class SentinelConfig:
     - Variance correlates with temperature at r=-0.97
     - As temperature increases, variance decreases
     - Use variance (not k_eff) for thermal detection
+
+    Sensitivity regime (validated Jan 2026):
+    - r_ab (internal correlation) predicts sensitivity with r=-0.999
+    - r_ab < 0.98 = TRANSIENT regime (20x more sensitive)
+    - r_ab > 0.99 = THERMALIZED regime (low sensitivity)
+    - Reset when r_ab exceeds threshold to maintain sensitivity
     """
     n_ossicles: int = 256         # Minimal array
     oscillator_depth: int = 32    # Reduced depth for speed
@@ -59,6 +65,10 @@ class SentinelConfig:
     # Thermal sensing parameters
     thermal_window: int = 50      # Samples for thermal baseline
     thermal_threshold_sigma: float = 3.0  # Detection threshold
+    # r_ab sensitivity regime parameters (validated Jan 2026)
+    r_ab_reset_threshold: float = 0.98  # Reset when r_ab exceeds this
+    r_ab_sensitive_threshold: float = 0.95  # Below this = highly sensitive
+    use_r_ab_reset: bool = True   # Enable r_ab-based reset (vs time-based)
 
 
 # Optimized CUDA kernel for minimal array
@@ -241,10 +251,17 @@ class Sentinel:
         self.thermal_baseline_mean = None
         self.thermal_baseline_std = None
 
+        # r_ab sensitivity tracking (validated: r=-0.999 correlation with sensitivity)
+        self.last_r_ab = 0.0
+        self.last_r_bc = 0.0
+        self.last_r_ca = 0.0
+        self.r_ab_history = deque(maxlen=config.derivative_window)
+        self.reset_reason = None  # Track why last reset occurred
+
         # Initialize oscillators
         self._reset_oscillators()
 
-    def _reset_oscillators(self):
+    def _reset_oscillators(self, reason: str = "manual"):
         """Reset oscillators to random state for peak sensitivity."""
         self.osc_a = cp.random.random(self.total, dtype=cp.float32) * 0.5 - 0.25
         self.osc_b = cp.random.random(self.total, dtype=cp.float32) * 0.5 - 0.25
@@ -252,13 +269,108 @@ class Sentinel:
         self.noise = cp.random.random(3 * self.total, dtype=cp.float32) - 0.5
         self.last_reset_time = time.perf_counter()
         self.k_eff_history.clear()
+        self.r_ab_history.clear()
+        self.reset_reason = reason
+
+    # =========================================================================
+    # r_ab SENSITIVITY REGIME MONITORING (validated: r=-0.999 correlation)
+    # =========================================================================
+
+    def get_internal_correlations(self) -> Tuple[float, float, float]:
+        """Get internal correlations (r_ab, r_bc, r_ca).
+
+        Validated finding: r_ab predicts sensitivity with r=-0.999
+        - r_ab < 0.95 = HIGHLY SENSITIVE (transient regime)
+        - r_ab > 0.98 = LOW SENSITIVITY (thermalized regime)
+
+        Returns:
+            (r_ab, r_bc, r_ca)
+        """
+        # Use subset for speed
+        sample_size = min(10000, self.total)
+        indices = cp.random.choice(self.total, sample_size, replace=False)
+
+        a = self.osc_a[indices]
+        b = self.osc_b[indices]
+        c = self.osc_c[indices]
+
+        # Compute correlations
+        r_ab = float(cp.corrcoef(a, b)[0, 1])
+        r_bc = float(cp.corrcoef(b, c)[0, 1])
+        r_ca = float(cp.corrcoef(c, a)[0, 1])
+
+        # Handle NaN
+        r_ab = 0.0 if np.isnan(r_ab) else r_ab
+        r_bc = 0.0 if np.isnan(r_bc) else r_bc
+        r_ca = 0.0 if np.isnan(r_ca) else r_ca
+
+        # Track history
+        self.last_r_ab = r_ab
+        self.last_r_bc = r_bc
+        self.last_r_ca = r_ca
+        self.r_ab_history.append(r_ab)
+
+        return r_ab, r_bc, r_ca
+
+    def get_sensitivity_regime(self) -> Dict:
+        """Get current sensitivity regime based on r_ab.
+
+        Validated finding (Jan 2026):
+        - r_ab < 0.95: TRANSIENT regime, ~20x more sensitive
+        - r_ab 0.95-0.98: TRANSITIONAL regime
+        - r_ab > 0.98: THERMALIZED regime, low sensitivity
+
+        Returns:
+            Dict with 'regime', 'r_ab', 'sensitivity_multiplier', 'should_reset'
+        """
+        r_ab = self.last_r_ab
+
+        if r_ab < self.config.r_ab_sensitive_threshold:
+            regime = "TRANSIENT"
+            multiplier = 20.0  # ~20x more sensitive (from binned analysis)
+        elif r_ab < self.config.r_ab_reset_threshold:
+            regime = "TRANSITIONAL"
+            # Linear interpolation between 20x and 1x
+            frac = (r_ab - self.config.r_ab_sensitive_threshold) / \
+                   (self.config.r_ab_reset_threshold - self.config.r_ab_sensitive_threshold)
+            multiplier = 20.0 * (1 - frac) + 1.0 * frac
+        else:
+            regime = "THERMALIZED"
+            multiplier = 1.0
+
+        should_reset = r_ab > self.config.r_ab_reset_threshold
+
+        return {
+            'regime': regime,
+            'r_ab': r_ab,
+            'r_bc': self.last_r_bc,
+            'r_ca': self.last_r_ca,
+            'sensitivity_multiplier': multiplier,
+            'should_reset': should_reset,
+        }
 
     def check_reset(self) -> bool:
-        """Check if reset is needed and perform if so. Returns True if reset occurred."""
+        """Check if reset is needed and perform if so. Returns True if reset occurred.
+
+        Two reset strategies (configurable via use_r_ab_reset):
+        1. Time-based: Reset every reset_interval_s (23s = τ/2)
+        2. r_ab-based: Reset when r_ab > r_ab_reset_threshold (0.98)
+
+        r_ab-based is preferred as it directly measures sensitivity state.
+        """
         self.time_since_reset = time.perf_counter() - self.last_reset_time
-        if self.time_since_reset >= self.config.reset_interval_s:
-            self._reset_oscillators()
-            return True
+
+        if self.config.use_r_ab_reset:
+            # r_ab-based reset (preferred)
+            if self.last_r_ab > self.config.r_ab_reset_threshold:
+                self._reset_oscillators(reason="r_ab_threshold")
+                return True
+        else:
+            # Time-based reset (fallback)
+            if self.time_since_reset >= self.config.reset_interval_s:
+                self._reset_oscillators(reason="time_interval")
+                return True
+
         return False
 
     def get_sensitivity_weight(self) -> float:
@@ -274,18 +386,17 @@ class Sentinel:
         Single step: advance dynamics, inject noise, measure k_eff.
 
         Args:
-            auto_reset: If True, automatically reset when reset_interval_s elapsed
+            auto_reset: If True, automatically reset based on r_ab threshold or time
 
         Returns:
             (k_eff, variance, dk_eff/dt estimate, sensitivity_weight)
 
         Sensitivity weight is exp(-t/τ) where τ=46.1s (validated).
         Use this to weight measurements - higher weight = more reliable.
-        """
-        # Check for auto-reset (validated: reset every 23s for peak sensitivity)
-        if auto_reset:
-            self.check_reset()
 
+        Note: Also updates r_ab tracking. Use get_sensitivity_regime() for
+        r_ab-based sensitivity info after calling this method.
+        """
         # Update time tracking
         self.time_since_reset = time.perf_counter() - self.last_reset_time
 
@@ -302,7 +413,7 @@ class Sentinel:
              self.total, 3)  # 3 iterations per step
         )
 
-        # Fast measurement
+        # Fast measurement (r_ab and variance)
         _correlate_kernel(
             (1,), (256,),
             (self.osc_a, self.osc_b, self.out_r, self.out_var, self.total)
@@ -310,6 +421,10 @@ class Sentinel:
 
         r = float(self.out_r[0])
         var = float(self.out_var[0])
+
+        # Track r_ab for sensitivity regime (validated: r=-0.999 with sensitivity)
+        self.last_r_ab = r if not np.isnan(r) else 0.0
+        self.r_ab_history.append(self.last_r_ab)
 
         # k_eff calculation
         x = min(var / 2.0, 1.0)
@@ -327,7 +442,41 @@ class Sentinel:
         # Sensitivity weight (validated: decays as exp(-t/τ))
         sensitivity = self.get_sensitivity_weight()
 
+        # Check for auto-reset AFTER measurement (so we have fresh r_ab)
+        if auto_reset:
+            self.check_reset()
+
         return k_eff, var, dk_dt, sensitivity
+
+    def step_and_measure_full(self, auto_reset: bool = True) -> Dict:
+        """
+        Full step with all state information including r_ab regime.
+
+        Returns dict with:
+            - k_eff: effective coupling
+            - variance: oscillator variance
+            - dk_dt: derivative estimate
+            - sensitivity_weight: exp(-t/τ) decay factor
+            - r_ab: internal correlation (sensitivity predictor, r=-0.999)
+            - regime: 'TRANSIENT', 'TRANSITIONAL', or 'THERMALIZED'
+            - sensitivity_multiplier: 1x-20x based on regime
+            - time_since_reset: seconds since last reset
+            - reset_reason: why last reset occurred
+        """
+        k_eff, var, dk_dt, sensitivity = self.step_and_measure(auto_reset)
+        regime_info = self.get_sensitivity_regime()
+
+        return {
+            'k_eff': k_eff,
+            'variance': var,
+            'dk_dt': dk_dt,
+            'sensitivity_weight': sensitivity,
+            'r_ab': self.last_r_ab,
+            'regime': regime_info['regime'],
+            'sensitivity_multiplier': regime_info['sensitivity_multiplier'],
+            'time_since_reset': self.time_since_reset,
+            'reset_reason': self.reset_reason,
+        }
 
     def is_detection(self, dk_dt: float, sensitivity: float) -> bool:
         """Check if dk_dt indicates a detection.

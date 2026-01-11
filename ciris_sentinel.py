@@ -53,9 +53,16 @@ class SentinelConfig:
     - r_ab < 0.98 = TRANSIENT regime (20x more sensitive)
     - r_ab > 0.99 = THERMALIZED regime (low sensitivity)
     - Reset when r_ab exceeds threshold to maintain sensitivity
+
+    Coupling strength (exp43 finding):
+    - epsilon=0.003 (default): OPTIMAL crossover, τ=12.8s, 64% transient
+    - epsilon=0.0003: Never thermalizes, weak signal (σ=0.03)
+    - epsilon=0.05: Thermalizes in 0.7s, strong signal (σ=3.1)
+    - Scaling law: τ ∝ ε^(-1.06)
     """
     n_ossicles: int = 256         # Minimal array
     oscillator_depth: int = 32    # Reduced depth for speed
+    epsilon: float = 0.003        # OPTIMAL: crossover point (25x signal, τ=12.8s)
     noise_amplitude: float = 0.001  # OPTIMAL: SR peak (was 0.02, too high!)
     sample_rate_hz: float = 1000  # High rate for short events
     derivative_window: int = 5    # Samples for derivative calc
@@ -230,9 +237,10 @@ class Sentinel:
 
         # Coupling constants
         angle_rad = np.radians(MAGIC_ANGLE)
-        self.coupling_ab = np.float32(np.cos(angle_rad) * COUPLING_FACTOR)
-        self.coupling_bc = np.float32(np.sin(angle_rad) * COUPLING_FACTOR)
-        self.coupling_ca = np.float32(COUPLING_FACTOR / PHI)
+        # Use configurable epsilon for coupling (default: 0.0003)
+        self.coupling_ab = np.float32(np.cos(angle_rad) * config.epsilon)
+        self.coupling_bc = np.float32(np.sin(angle_rad) * config.epsilon)
+        self.coupling_ca = np.float32(config.epsilon / PHI)
 
         # CUDA config
         self.block_size = min(256, self.total)
@@ -428,7 +436,7 @@ class Sentinel:
 
         # k_eff calculation
         x = min(var / 2.0, 1.0)
-        k_eff = r * (1 - x) * COUPLING_FACTOR * 1000
+        k_eff = r * (1 - x) * self.config.epsilon * 1000
 
         # Derivative estimate
         self.k_eff_history.append(k_eff)

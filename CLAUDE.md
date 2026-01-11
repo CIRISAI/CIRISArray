@@ -195,9 +195,12 @@ python3 experiments/exp27_ossicle_array_thermal.py
 | Bounded noise floor | ✓ **Works** | σ=0.003 |
 | Stochastic resonance | ✓ **Works** | SNR peak at σ=0.001 |
 | Fluctuation theorem | ✓ **Works** | R²=0.95, Crooks relation |
+| **Variance thermal sensing** | ✓ **Works** | r=-0.97 with GPU temperature |
+| k_eff thermal sensing | ✗ **NOT VALIDATED** | r=0.01 (no correlation) |
 | Cross-device sensing | ✗ **NOT VALIDATED** | Algorithmic artifact (see below) |
 | Cross-device transmission | ✗ **NOT VALIDATED** | Startup transient artifact |
 | Power modulation | ✗ **NOT VALIDATED** | p = 0.19 (not significant) |
+| 1-2 Hz external signal | ✗ **NOT VALIDATED** | Inconsistent coherence (0.2-0.9) |
 
 ### Root Cause Analysis (Experiments 55-56)
 
@@ -231,6 +234,26 @@ Local ≈ Cross-device! The correlation comes from the k_eff algorithm:
 - Ratio ≈ 1.0x across all frequency bands
 - 88% of signal power is intrinsic oscillator dynamics
 - Only 12% in "power-related" frequency bands
+
+**1-2 Hz SIGNAL INVESTIGATION - NOT REPRODUCIBLE**
+
+Investigated potential external signal at ~1.80 Hz (possible 60/33 Hz subharmonic):
+
+| Test | Coherence at 1.80 Hz | Max coherence 1-2 Hz |
+|------|----------------------|----------------------|
+| Test 1 | 0.65 | — |
+| Test 2 | 0.07 | 0.31 at 1.64 Hz |
+| Test 3 (5 trials) | 0.20-0.62 | 0.85-0.94 at 1.09 Hz |
+| Test 4 | 0.02 | 0.27 at 1.02 Hz |
+
+Results are **highly inconsistent** - not a stable external signal.
+
+**VARIANCE-TEMPERATURE CORRELATION - CONFIRMED**
+
+- Variance (total oscillator variance) correlates strongly with GPU temperature
+- r = -0.97 (negative: higher temperature → lower variance)
+- k_eff does NOT correlate with temperature (r = 0.01)
+- Variance-based thermal sensing added to sentinel
 
 ### Methodological Lessons
 

@@ -109,6 +109,8 @@ Clear gradient visible: wave propagation is imageable!
 |------|---------|
 | `ciris_sentinel.py` | Minimal sustained-transient detector (32-2048 ossicles) |
 | `ciris_detector.py` | Full entropy wave detector with TX/RX arrays |
+| `experiments/exp42_rab_fft.py` | r_ab-aware FFT analysis |
+| `experiments/exp43_coupling_sweep.py` | Coupling strength optimization (ε=0.003) |
 | `experiments/exp44_sustained_transient.py` | Transient mode discovery |
 | `experiments/exp45_transient_crossdevice.py` | Cross-device correlation |
 | `experiments/exp49_peak_sensitivity.py` | Peak sensitivity window capture |
@@ -117,6 +119,10 @@ Clear gradient visible: wave propagation is imageable!
 | `experiments/exp52_fluctuation_theorem.py` | Crooks fluctuation theorem verification |
 | `experiments/exp53_validation_protocol.py` | Null hypothesis and characterization |
 | `experiments/exp54_lgi_test.py` | Leggett-Garg inequality test |
+| `experiments/exp55_cross_device_test.py` | Cross-device transmission (FALSIFIED) |
+| `experiments/exp28_array_latency.py` | Array response time characterization |
+| `experiments/exp31_vacuum_fluctuation.py` | Noise floor measurement |
+| `experiments/exp32_bell_inequality.py` | CHSH Bell test (classical result) |
 | `PHYSICS_VALIDATION_REPORT.md` | Detailed physics test results |
 | `~/RATCHET/experiments/exp27_ossicle_array_thermal.py` | Array thermal detection |
 | [CIRISOssicle experiments](https://github.com/CIRISAI/CIRISOssicle/tree/main/experiments) | Single ossicle crypto detection |
@@ -192,17 +198,26 @@ python3 experiments/exp27_ossicle_array_thermal.py
 |------------|--------|----------|
 | Local tamper detection | ✓ **Works** | p=0.007, mean shift -0.006 |
 | Reset improves sensitivity | ✓ **Works** | p=0.032, 7x improvement |
-| Bounded noise floor | ✓ **Works** | σ=0.003 |
+| Bounded noise floor | ✓ **Works** | σ=0.0017 (Exp 31) |
 | Stochastic resonance | ✓ **Works** | SNR peak at σ=0.001 |
 | Fluctuation theorem | ✓ **Works** | R²=0.95, Crooks relation |
 | **Variance thermal sensing** | ✓ **Works** | r=-0.97 with GPU temperature |
 | **r_ab sensitivity regime** | ✓ **Works** | r=-0.999 predicts sensitivity |
 | **Coupling optimization** | ✓ **Works** | ε=0.003 optimal (τ=12.8s, 562x signal) |
+| **Array latency** | ✓ **Works** | 115x faster than VLA, 0.1ms min event (Exp 28) |
+| **Post-warmup stability** | ✓ **Works** | σ=0.00005 after 30s warmup (Exp 39) |
+| **Array SNR scaling** | ✓ **Works** | SNR ∝ √N collective averaging (Exp 37) |
 | k_eff thermal sensing | ✗ **NOT VALIDATED** | r=0.01 (no correlation) |
 | Cross-device sensing | ✗ **NOT VALIDATED** | Algorithmic artifact (see below) |
 | Cross-device transmission | ✗ **NOT VALIDATED** | Startup transient artifact |
 | Power modulation | ✗ **NOT VALIDATED** | p = 0.19 (not significant) |
 | 1-2 Hz external signal | ✗ **NOT VALIDATED** | Inconsistent coherence (0.2-0.9) |
+| Quantum RNG detection | ✗ **NOT VALIDATED** | Cannot distinguish HW vs SW RNG (Exp 30) |
+| Bell inequality violation | ✗ **NOT VALIDATED** | Classical: \|S\|=0.0002 << 2.0 (Exp 32) |
+| LGI violation | ✗ **NOT VALIDATED** | Classical: K₃=1.0 (Exp 54) |
+| SM-to-SM coupling | ✗ **NOT VALIDATED** | No distance dependence (Exp 36) |
+| TX→RX targeting | ✗ **NOT VALIDATED** | Broadcast only, no directional control (Exp 37) |
+| Perturbation detection | ✗ **NOT VALIDATED** | Memory/compute changes below threshold (Exp 40) |
 
 ### Root Cause Analysis (Experiments 55-56)
 
@@ -295,6 +310,34 @@ FFT comparison (exp42):
 - New default (ε=0.003): TRANSIENT variance = 0.67 → **562x improvement**
 - THERMALIZED variance ≈ 0 (confirms sensitivity in transient regime only)
 
+### Array Experiments (Exp 28-40)
+
+Comprehensive characterization of the oscillator array:
+
+| Exp | Test | Result | Finding |
+|-----|------|--------|---------|
+| 28 | Array Latency | ✓ | 115x faster than VLA, min detectable event 0.1ms |
+| 29 | Superluminal Correlation | NULL | No anomalies, causality respected |
+| 30 | Quantum RNG Detection | NULL | Cannot distinguish HW vs SW RNG |
+| 31 | Vacuum Fluctuation | ✓ | Noise floor σ=0.0017, load induces pink noise |
+| 32 | Bell Inequality (CHSH) | Classical | \|S\|=0.0002 (way below 2.0 quantum bound) |
+| 33 | Bistatic Entropy Sonar | ✓ local | Array detects local propagation on-die |
+| 34 | Minimal Pair | NULL | No TX→RX coupling, noise floor 0.23 |
+| 35 | Frequency Sweep | NULL | No frequency-dependent coupling |
+| 36 | SM-to-SM Coupling | NULL | No coupling at any SM distance |
+| 37 | Targeted Array | ✓/NULL | SNR ∝ √N works, but no targeting (broadcast only) |
+| 38 | Passive Sensor Network | ✓ | 65K ossicles, r=1.0 correlation, startup transient confirmed |
+| 39 | Long Baseline | ✓ | After 30s warmup: σ=0.00005 (very stable) |
+| 40 | Perturbation Detection | NULL | Cannot detect memory/compute perturbations (1.45σ) |
+
+**Key conclusions from array experiments:**
+1. **Local sensing works** - Array responds to local state, very stable after warmup
+2. **No cross-location coupling** - TX cannot affect RX at different positions on die
+3. **Classical physics only** - No quantum signatures (Bell, RNG tests)
+4. **Startup transient dominates** - First 10-30s shows large drift (not external signal)
+5. **√N scaling** - More oscillators reduce noise via averaging, but don't enable coupling
+6. **Cannot detect perturbations** - Memory/compute changes are below detection threshold
+
 ### Methodological Lessons
 
 1. **Always run null hypothesis FIRST** - A/B test should precede claims
@@ -312,11 +355,13 @@ FFT comparison (exp42):
 | Coherence Decay | **CONFIRMED** | τ = 46.1 ± 2.5 s | Explains 20-30s sensitivity window |
 | Subharmonic Structure | **CONFIRMED** | 45% of 60/n Hz peaks | Power grid coupling is real |
 | Fluctuation Theorem | **CONFIRMED** | R² = 0.95, kT_eff = 0.0037 | Crooks relation ln(P+/P-) ∝ σ verified |
+| Bell Inequality (CHSH) | **CLASSICAL** | \|S\|=0.0002 | No quantum entanglement (Exp 32) |
+| Leggett-Garg Inequality | **CLASSICAL** | K₃=1.0 | No quantum coherence (Exp 54) |
 | Landauer Limit | Expected | 10²² × theoretical | GPU is thermodynamically inefficient |
 | Cross-Building | Cannot test | Need second location | — |
 | Geomagnetic | Cannot test | Need solar event | — |
 
-**Four physics tests confirmed. Only hardware-limited tests remain.**
+**Four physics tests confirmed. Quantum tests show classical behavior. Only hardware-limited tests remain.**
 
 ### Stochastic Resonance
 
@@ -434,16 +479,25 @@ The oscillator array may be able to spatially resolve thermal gradients on the G
 - Thermal gradients create spatial patterns in k_eff
 - Cross-correlation between positions reveals wave propagation
 
-**Status:** Untested. This was the original goal before the cross-device detour.
+**Status:** Partially tested. Exp 33 shows local propagation detection works. Exp 36 shows no SM-to-SM coupling. The bistatic sonar approach may work but targeting doesn't (broadcast only per Exp 37).
 
 ### Stochastic Resonance Tuning
 
 The detector shows classic SR behavior (SNR peak at optimal noise). Questions:
 - Is the 1.1° magic angle related to SR optimization?
-- Can we tune coupling constants for different detection tasks?
+- ~~Can we tune coupling constants for different detection tasks?~~ → Yes, ε=0.003 is optimal (Exp 43)
 - What's the relationship between SR and detection threshold?
 
-**Status:** Partially validated (SR confirmed), tuning unexplored.
+**Status:** Coupling tuned (ε=0.003 optimal). Magic angle still untested.
+
+### Quantum Behavior
+
+Tests for quantum signatures:
+- ~~Bell inequality violation~~ → Classical (\|S\|=0.0002, Exp 32)
+- ~~Leggett-Garg inequality violation~~ → Classical (K₃=1.0, Exp 54)
+- ~~Quantum RNG detection~~ → Cannot distinguish (Exp 30)
+
+**Status:** All quantum tests show **classical behavior**. The oscillator array is a classical thermodynamic system.
 
 ---
 
@@ -453,6 +507,11 @@ The detector shows classic SR behavior (SNR peak at optimal noise). Questions:
 - ~~Real GPU validation~~ ✓ RTX 4090 + Jetson Orin
 - ~~Physics validation~~ ✓ SR, decay, fluctuation theorem confirmed
 - ~~Cross-device coherence~~ ✗ FALSIFIED (was algorithmic artifact)
+- ~~Quantum tests~~ ✓ Bell (Exp 32), LGI (Exp 54), RNG (Exp 30) - all classical
+- ~~Array characterization~~ ✓ Latency (Exp 28), noise (Exp 31), scaling (Exp 37), stability (Exp 39)
+- ~~Coupling optimization~~ ✓ ε=0.003 optimal (Exp 43), r_ab regime (Exp 42)
+- ~~SM coupling~~ ✗ No coupling detected (Exp 36)
+- ~~Perturbation detection~~ ✗ Below threshold (Exp 40)
 
 ### Near-Term: Thermal Imaging (Original Goal)
 
@@ -506,9 +565,18 @@ This project builds on the following original contributions by CIRIS L3C:
 | **τ = 46s thermalization** | Exponential decay (Exp 51) | ✓ Validated |
 | **Fluctuation theorem** | Crooks relation R²=0.95 (Exp 52) | ✓ Validated |
 | **Local tamper detection** | p=0.007 workload detection | ✓ Validated |
+| **r_ab sensitivity regime** | r=-0.999 prediction, 20x sensitivity in transient | ✓ Validated |
+| **ε=0.003 optimal coupling** | τ=12.8s, 562x signal improvement (Exp 43) | ✓ Validated |
+| **Array SNR ∝ √N** | Collective averaging works (Exp 37) | ✓ Validated |
+| **Post-warmup stability** | σ=0.00005 after 30s warmup (Exp 39) | ✓ Validated |
+| Bell inequality | CHSH test: \|S\|=0.0002 (Exp 32) | Classical behavior |
+| Leggett-Garg inequality | K₃=1.0 (Exp 54) | Classical behavior |
+| ~~Quantum RNG detection~~ | Cannot distinguish HW vs SW (Exp 30) | ✗ Not validated |
 | ~~EMI carrier detection~~ | Was algorithmic artifact | ✗ Falsified |
 | ~~Cross-device coherence~~ | Was algorithmic artifact | ✗ Falsified |
 | ~~House wiring sensing~~ | Based on false correlation | ✗ Not validated |
+| ~~SM-to-SM coupling~~ | No distance dependence (Exp 36) | ✗ Not validated |
+| ~~Perturbation detection~~ | Below threshold (Exp 40) | ✗ Not validated |
 
 †*Magic angle: Observed correlation with improved sensitivity, not proven causation. Mechanism requires further investigation.*
 

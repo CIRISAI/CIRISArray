@@ -196,6 +196,7 @@ python3 experiments/exp27_ossicle_array_thermal.py
 | Stochastic resonance | ✓ **Works** | SNR peak at σ=0.001 |
 | Fluctuation theorem | ✓ **Works** | R²=0.95, Crooks relation |
 | **Variance thermal sensing** | ✓ **Works** | r=-0.97 with GPU temperature |
+| **r_ab sensitivity regime** | ✓ **Works** | r=-0.999 predicts sensitivity |
 | k_eff thermal sensing | ✗ **NOT VALIDATED** | r=0.01 (no correlation) |
 | Cross-device sensing | ✗ **NOT VALIDATED** | Algorithmic artifact (see below) |
 | Cross-device transmission | ✗ **NOT VALIDATED** | Startup transient artifact |
@@ -254,6 +255,26 @@ Results are **highly inconsistent** - not a stable external signal.
 - r = -0.97 (negative: higher temperature → lower variance)
 - k_eff does NOT correlate with temperature (r = 0.01)
 - Variance-based thermal sensing added to sentinel
+
+**r_ab SENSITIVITY REGIME - CONFIRMED**
+
+Internal correlation r_ab predicts sensitivity with r = -0.999 (nearly perfect!):
+
+| r_ab Range | Regime | Sensitivity | Response |
+|------------|--------|-------------|----------|
+| < 0.95 | TRANSIENT | ~20x higher | 0.91 units |
+| 0.95-0.98 | TRANSITIONAL | Decaying | — |
+| > 0.98 | THERMALIZED | Baseline | 0.04 units |
+
+This explains the exp(-t/τ) sensitivity decay:
+- As oscillators thermalize, r_ab approaches 1.0
+- When r_ab ≈ 1.0, oscillators are fully synchronized → cannot detect perturbations
+- Resetting when r_ab > 0.98 maintains peak sensitivity
+
+Added to sentinel:
+- `get_sensitivity_regime()`: Returns regime, r_ab, sensitivity multiplier
+- `step_and_measure_full()`: Returns full state including r_ab
+- r_ab-based auto-reset (preferred over time-based)
 
 ### Methodological Lessons
 

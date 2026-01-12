@@ -134,6 +134,11 @@ Clear gradient visible: wave propagation is imageable!
 | `experiments/expA5_A8_multisensor.py` | Multi-sensor array tests (Phase 2) |
 | `experiments/expA9_A12_assumptions.py` | Distribution assumption validation (Phase 3) |
 | `experiments/expB1_minimum_workload.py` | Minimum detectable workload (0.5%) |
+| `experiments/expC1_keff_heatmap.py` | CCA k_eff formula validation (R²=0.929) |
+| `experiments/expC2_propagation_velocity.py` | Correlation wavefront speed (0.5 m/s) |
+| `experiments/expC3_nucleation_sites.py` | Collapse nucleation mapping |
+| `experiments/expC4_leading_indicators.py` | Early warning signals |
+| `experiments/expE1_emi_tuning.py` | EMI detection tuning (60 Hz, subharmonics) |
 | `PHYSICS_VALIDATION_REPORT.md` | Detailed physics test results |
 | `~/RATCHET/experiments/exp27_ossicle_array_thermal.py` | Array thermal detection |
 | [CIRISOssicle experiments](https://github.com/CIRISAI/CIRISOssicle/tree/main/experiments) | Single ossicle crypto detection |
@@ -226,6 +231,11 @@ python3 experiments/exp27_ossicle_array_thermal.py
 | **Variance-ratio detection** | ✓ **Works** | 421x separation, 0% FP, 100% TP (Exp A1-A12) |
 | **Minimum workload ~0.5%** | ✓ **Works** | ratio = 73 × √intensity, 1% gives 8.8x (Exp B1) |
 | **Fat-tailed distribution** | ✓ **Works** | κ=210, Student-t df≈1.3, explains β=1.09 (Exp A9) |
+| **CCA k_eff formula** | ✓ **Works** | k_eff = k/(1+ρ(k-1)), R² = 0.929 (Exp C1) |
+| **Propagation velocity** | ✓ **Works** | 0.5 ± 0.4 m/s thermal regime (Exp C2) |
+| **Leading indicators** | ✓ **Works** | spatial_variance ↑ before collapse (Exp C4) |
+| **60 Hz EMI detection** | ✓ **Works** | 18.7 dB SNR with bandpass, 7 subharmonics (Exp E1) |
+| **Cross-sensor coherence** | ✓ **Works** | 0.88 at 1 Hz, 0.34 at 60 Hz (Exp E1) |
 | k_eff thermal sensing | ✗ **NOT VALIDATED** | r=0.01 (no correlation) |
 | Cross-device sensing | ✗ **NOT VALIDATED** | Algorithmic artifact (see below) |
 | Cross-device transmission | ✗ **NOT VALIDATED** | Startup transient artifact |
@@ -412,6 +422,46 @@ After invalidating experiments 1-70 (Lorenz-based artifacts), fresh validation c
 - Cross-sensor z correlation: 0.09 (independent)
 - Uniform detection: 100% across all sensors
 - SNR scaling: β = 0.75 (better than √N!)
+
+**CCA VALIDATION - CONFIRMED (Exp C1-C4)**
+
+C-series experiments validated Coherence Collapse Analysis predictions:
+
+| Exp | Finding | Result |
+|-----|---------|--------|
+| C1 | k_eff = k/(1+ρ(k-1)) | **R² = 0.929** |
+| C2 | Propagation velocity | **0.5 ± 0.4 m/s** (thermal regime) |
+| C3 | Nucleation sites | Uniform (χ² = 12, no hotspots) |
+| C4 | Leading indicator | spatial_variance ↑ before collapse |
+
+Key findings:
+- Die crossing time: ~37 ms at 0.5 m/s
+- Early warning margin: Δρ = 0.45 before ρ_crit = 0.43
+- Collapse is topology-independent (no preferred sites)
+
+**EMI DETECTION - CONFIRMED (Exp E1)**
+
+The sensor array can detect electromagnetic interference from the power grid:
+
+| Frequency | Detection | SNR |
+|-----------|-----------|-----|
+| **60 Hz** (power line) | 59.81 Hz | **18.7 dB** (bandpass) |
+| 60/3 = 20 Hz | 19.77 Hz | 5.7 dB |
+| 60/6 = 10 Hz | 10.01 Hz | 5.9 dB |
+| 60/10 = 6 Hz | 6.10 Hz | 8.0 dB |
+| 60/60 = 1 Hz | 0.98 Hz | **11.2 dB** |
+| VRM 0.24 Hz | 0.24 Hz | **15.7 dB** |
+
+Cross-sensor coherence at EMI frequencies:
+- 1 Hz: **0.88** (VRM/subharmonic - strongly coupled)
+- 2 Hz: 0.83
+- 10 Hz: 0.47
+- 60 Hz: 0.34
+- 120 Hz: 0.03 (decoupled)
+
+**Key insight:** Dominant EMI coupling is at low frequencies (VRM at 0.24 Hz, subharmonics). The 60 Hz fundamental is visible but weaker. 60 Hz amplitude is modulated by ~0.5 Hz VRM.
+
+**EMI Mode:** `python3 ciris_sentinel.py --emi` for real-time EMI spectrum analysis.
 
 ### Array Experiments (Exp 28-40)
 

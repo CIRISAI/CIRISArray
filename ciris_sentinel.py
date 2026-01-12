@@ -2021,6 +2021,170 @@ class RawTimingTRNG:
         }
 
 
+def emi_mode(duration: int = 30, sample_rate: int = 500):
+    """
+    EMI spectrum analysis mode.
+
+    Detects electromagnetic interference from power grid (60 Hz + harmonics),
+    VRM switching frequencies, and subharmonics.
+
+    Args:
+        duration: Capture duration in seconds
+        sample_rate: Sample rate in Hz (default 500 for 250 Hz Nyquist)
+    """
+    from scipy import signal as scipy_signal
+
+    print("=" * 60)
+    print("CIRIS SENTINEL: EMI Spectrum Analysis")
+    print("=" * 60)
+    print(f"\nSample rate: {sample_rate} Hz (Nyquist: {sample_rate//2} Hz)")
+    print(f"Duration: {duration} seconds")
+    print(f"Frequency resolution: {1/duration:.4f} Hz")
+
+    # Create sensor
+    config = SentinelConfig(n_ossicles=256)
+    sensor = Sentinel(config)
+
+    # Warmup
+    print("\nWarming up sensor...")
+    for _ in range(100):
+        sensor.step_and_measure(auto_reset=False)
+
+    # Collect samples
+    print(f"\nCollecting EMI data...")
+    timings = []
+    interval = 1.0 / sample_rate
+    start = time.time()
+
+    n_samples = duration * sample_rate
+    for i in range(n_samples):
+        target = start + i * interval
+
+        # Measure timing
+        t0 = time.perf_counter_ns()
+        sensor.step_and_measure(auto_reset=False)
+        cp.cuda.stream.get_current_stream().synchronize()
+        t1 = time.perf_counter_ns()
+        timings.append((t1 - t0) / 1000.0)  # μs
+
+        # Maintain sample rate
+        sleep_time = target + interval - time.time()
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+        if (i + 1) % (sample_rate * 5) == 0:
+            pct = 100 * (i + 1) / n_samples
+            print(f"  {pct:.0f}%...")
+
+    timings = np.array(timings)
+    actual_rate = len(timings) / (time.time() - start)
+    print(f"\nActual rate: {actual_rate:.0f} Hz")
+
+    # Compute PSD
+    print("\n" + "=" * 60)
+    print("EMI SPECTRUM ANALYSIS")
+    print("=" * 60)
+
+    y = timings - np.mean(timings)
+    y = scipy_signal.detrend(y)
+
+    nperseg = min(len(y) // 4, 2048)
+    freqs, psd = scipy_signal.welch(y, fs=actual_rate, nperseg=nperseg)
+
+    # Find peaks
+    peak_idx, _ = scipy_signal.find_peaks(psd, height=np.median(psd) * 2, distance=3)
+    noise_floor = np.median(psd)
+
+    # EMI target frequencies
+    HARMONICS = [60, 120, 180, 240]
+    SUBHARMONICS = [60/n for n in [2, 3, 4, 5, 6, 10, 12, 15, 20, 30, 60]]
+
+    # Check for EMI
+    print("\n60 Hz HARMONICS:")
+    print("-" * 40)
+    for target in HARMONICS:
+        if target > actual_rate / 2:
+            continue
+        # Find closest peak
+        mask = (freqs > target - 2) & (freqs < target + 2)
+        if np.any(mask):
+            idx = np.argmax(psd[mask])
+            freq = freqs[mask][idx]
+            power = psd[mask][idx]
+            snr = 10 * np.log10(power / noise_floor) if noise_floor > 0 else 0
+            if snr > 3:
+                print(f"  {target:4.0f} Hz: detected at {freq:.2f} Hz, SNR = {snr:.1f} dB")
+            else:
+                print(f"  {target:4.0f} Hz: below noise floor")
+        else:
+            print(f"  {target:4.0f} Hz: not in range")
+
+    print("\nSUBHARMONICS (60/n Hz):")
+    print("-" * 40)
+    detected_sub = []
+    for target in sorted(SUBHARMONICS, reverse=True):
+        mask = (freqs > target - 0.5) & (freqs < target + 0.5)
+        if np.any(mask):
+            idx = np.argmax(psd[mask])
+            freq = freqs[mask][idx]
+            power = psd[mask][idx]
+            snr = 10 * np.log10(power / noise_floor) if noise_floor > 0 else 0
+            if snr > 3:
+                n = int(round(60 / target))
+                detected_sub.append((target, freq, snr))
+                print(f"  60/{n:2d} = {target:5.2f} Hz: detected at {freq:.2f} Hz, SNR = {snr:.1f} dB")
+
+    print("\nVRM FREQUENCIES (< 2 Hz):")
+    print("-" * 40)
+    vrm_peaks = []
+    for i in peak_idx:
+        if freqs[i] < 2.0:
+            snr = 10 * np.log10(psd[i] / noise_floor) if noise_floor > 0 else 0
+            if snr > 3:
+                vrm_peaks.append((freqs[i], snr))
+                print(f"  {freqs[i]:.3f} Hz: SNR = {snr:.1f} dB")
+
+    print("\nTOP 10 SPECTRAL PEAKS:")
+    print("-" * 40)
+    sorted_peaks = sorted(zip(freqs[peak_idx], psd[peak_idx]),
+                         key=lambda x: -x[1])[:10]
+    for f, p in sorted_peaks:
+        snr = 10 * np.log10(p / noise_floor)
+        # Identify if EMI
+        emi = ""
+        if abs(f - 60) < 2:
+            emi = "← 60 Hz"
+        elif abs(f - 120) < 2:
+            emi = "← 120 Hz"
+        elif abs(f - 180) < 2:
+            emi = "← 180 Hz"
+        else:
+            for n in range(2, 61):
+                if abs(f - 60/n) < 0.5:
+                    emi = f"← 60/{n}"
+                    break
+        print(f"  {f:7.2f} Hz: SNR = {snr:5.1f} dB {emi}")
+
+    # Summary
+    print("\n" + "=" * 60)
+    print("EMI SUMMARY")
+    print("=" * 60)
+    n_harmonics = sum(1 for h in HARMONICS if h <= actual_rate/2 and
+                      any(abs(freqs[i] - h) < 2 and
+                          10*np.log10(psd[i]/noise_floor) > 3 for i in peak_idx))
+    print(f"  60 Hz harmonics detected: {n_harmonics}/4")
+    print(f"  Subharmonics detected: {len(detected_sub)}")
+    print(f"  VRM peaks detected: {len(vrm_peaks)}")
+    print(f"  Noise floor: {noise_floor:.2e}")
+
+    if n_harmonics >= 1 or len(detected_sub) >= 3:
+        print("\n  Status: EMI VISIBLE")
+    else:
+        print("\n  Status: EMI below detection threshold")
+
+    print("=" * 60)
+
+
 def main():
     """Run sentinel tests, TRNG demo, or timing server."""
     import argparse
@@ -2044,6 +2208,14 @@ def main():
     parser.add_argument('--timing-samples', type=int, default=100,
                         help='Number of calibration samples')
 
+    # EMI detection options
+    parser.add_argument('--emi', action='store_true',
+                        help='Run EMI spectrum analysis mode')
+    parser.add_argument('--emi-duration', type=int, default=30,
+                        help='EMI capture duration in seconds')
+    parser.add_argument('--emi-rate', type=int, default=500,
+                        help='EMI sample rate in Hz (default 500)')
+
     args = parser.parse_args()
 
     # Timing server mode (run on Jetson)
@@ -2060,6 +2232,11 @@ def main():
     if args.trng or args.stream or args.test:
         trng_demo(n_bytes=args.bytes, output_file=args.output,
                   stream=args.stream, test=args.test)
+        return
+
+    # EMI mode
+    if args.emi:
+        emi_mode(duration=args.emi_duration, sample_rate=args.emi_rate)
         return
 
     # Original sentinel demo

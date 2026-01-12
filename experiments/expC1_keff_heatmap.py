@@ -179,7 +179,8 @@ def main():
     print("=" * 70)
     print()
 
-    sync_strengths = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    # Use 21 points for statistically robust R² (df=19 instead of df=9)
+    sync_strengths = np.linspace(0.0, 0.8, 21).tolist()  # 0.0, 0.04, 0.08, ... 0.8
     sweep_results = []
 
     barrier_event = threading.Event()

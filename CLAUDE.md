@@ -231,7 +231,7 @@ python3 experiments/exp27_ossicle_array_thermal.py
 | **Variance-ratio detection** | ✓ **Works** | 421x separation, 0% FP, 100% TP (Exp A1-A12) |
 | **Minimum workload ~0.5%** | ✓ **Works** | ratio = 73 × √intensity, 1% gives 8.8x (Exp B1) |
 | **Fat-tailed distribution** | ✓ **Works** | κ=210, Student-t df≈1.3, explains β=1.09 (Exp A9) |
-| **CCA k_eff formula** | ✓ **Works** | k_eff = k/(1+ρ(k-1)), R² = 0.929 (Exp C1) |
+| **CCA k_eff formula** | ✓ **Works** | k_eff = k/(1+ρ(k-1)), R² = 0.798, n=21 (Exp C1) |
 | **Propagation velocity** | ✓ **Works** | 0.5 ± 0.4 m/s thermal regime (Exp C2) |
 | **Leading indicators** | ✓ **Works** | spatial_variance ↑ before collapse (Exp C4) |
 | **60 Hz EMI detection** | ✓ **Works** | 18.7 dB SNR with bandpass, 7 subharmonics (Exp E1) |
@@ -429,7 +429,7 @@ C-series experiments validated Coherence Collapse Analysis predictions:
 
 | Exp | Finding | Result |
 |-----|---------|--------|
-| C1 | k_eff = k/(1+ρ(k-1)) | **R² = 0.929** |
+| C1 | k_eff = k/(1+ρ(k-1)) | **R² = 0.798** (n=21, df=19) |
 | C2 | Propagation velocity | **0.5 ± 0.4 m/s** (thermal regime) |
 | C3 | Nucleation sites | Uniform (χ² = 12, no hotspots) |
 | C4 | Leading indicator | spatial_variance ↑ before collapse |

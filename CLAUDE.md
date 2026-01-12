@@ -139,6 +139,10 @@ Clear gradient visible: wave propagation is imageable!
 | `experiments/expC3_nucleation_sites.py` | Collapse nucleation mapping |
 | `experiments/expC4_leading_indicators.py` | Early warning signals |
 | `experiments/expE1_emi_tuning.py` | EMI detection tuning (60 Hz, subharmonics) |
+| `experiments/expE1_resilient_high_rho.py` | Block structure resilience (negative examples) |
+| `experiments/expE2_delta_rho_ci.py` | Δρ confidence interval (30 trials) |
+| `experiments/expE3_velocity_discrepancy.py` | Velocity non-thermal (PDN/scheduler) |
+| `experiments/expE4_collapse_threshold.py` | Operational collapse threshold (k_eff < 4) |
 | `PHYSICS_VALIDATION_REPORT.md` | Detailed physics test results |
 | `~/RATCHET/experiments/exp27_ossicle_array_thermal.py` | Array thermal detection |
 | [CIRISOssicle experiments](https://github.com/CIRISAI/CIRISOssicle/tree/main/experiments) | Single ossicle crypto detection |
@@ -236,6 +240,10 @@ python3 experiments/exp27_ossicle_array_thermal.py
 | **Leading indicators** | ✓ **Works** | spatial_variance ↑ before collapse (Exp C4) |
 | **60 Hz EMI detection** | ✓ **Works** | 18.7 dB SNR with bandpass, 7 subharmonics (Exp E1) |
 | **Cross-sensor coherence** | ✓ **Works** | 0.88 at 1 Hz, 0.34 at 60 Hz (Exp E1) |
+| **Δρ early warning** | ✓ **Works** | Δρ = 0.317 ± 0.125, 95% CI excludes 0 (Exp E2) |
+| **Collapse threshold** | ✓ **Works** | k_eff_critical = 4.0, latency 2.3x at collapse (Exp E4) |
+| **Block structure resilience** | ✓ **Works** | ρ_intra > ρ_inter preserves k_eff (Exp E1) |
+| **Velocity = non-thermal** | ✓ **Works** | 0.5 m/s = 50x thermal (0.01 m/s), PDN/scheduler (Exp E3) |
 | k_eff thermal sensing | ✗ **NOT VALIDATED** | r=0.01 (no correlation) |
 | Cross-device sensing | ✗ **NOT VALIDATED** | Algorithmic artifact (see below) |
 | Cross-device transmission | ✗ **NOT VALIDATED** | Startup transient artifact |

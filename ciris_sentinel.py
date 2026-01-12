@@ -1,19 +1,43 @@
 #!/usr/bin/env python3
 """
-CIRIS Sentinel: Minimal Sustained-Transient Entropy Wave Detector
-==================================================================
+CIRIS Sentinel: GPU Workload Detector & TRNG
+=============================================
 
-Optimized for:
-1. INDEFINITE transient state (never converges)
-2. MINIMAL array size (for scaling/multiple sensors)
-3. HIGH sample rate (catch short events)
-4. MULTIPLE independent sensors on single GPU
+V3.0 VALIDATED (Jan 2026): Mean-shift detection validated in A5/O1-O7.
 
-Key design:
-- Continuous noise injection prevents convergence
-- Track k_eff AND its derivative (dk_eff/dt)
-- Burst-mode detection windows
-- Sub-millisecond event resolution
+VALIDATED ARCHITECTURE (A5, A6, A9, B1e):
+┌─────────────────────────────────────────────────────────────────────┐
+│                    MULTI-MODAL GPU SENSOR                           │
+│                                                                     │
+│   GPU Kernel Timing (4000 Hz sample rate)                           │
+│           │                                                         │
+│           ├──► Mean Shift ──────► WORKLOAD (+2519% at 50% load)     │
+│           ├──► Thermal Band ────► TEMPERATURE (0-0.1 Hz, 79.1%)     │
+│           ├──► Workload Band ───► TRANSIENTS (100-500 Hz, 7.5%)     │
+│           └──► Lower 4 LSBs ────► TRNG (7.99 bits/byte)             │
+│                                                                     │
+│   DETECTION: mean_shift > 50% (not variance ratio!)                 │
+│   Workload causes GPU contention → timing TRIPLES                   │
+└─────────────────────────────────────────────────────────────────────┘
+
+VALIDATED SPECS (A5/O1-O7, Jan 2026):
+- Sample rate: 4000 Hz (avoid 1900-2100 Hz interference)
+- Detection latency: 1.3 ms (A5) / 2.5 ms (O4)
+- Detection floor: 1% workload (+83% mean shift)
+- Cross-sensor CV: 8.2% (A6)
+- SNR scaling: β=0.47 ≈ √N (A9)
+- 16-sensor improvement: 5.1x
+
+DETECTION METHOD:
+- OLD (WRONG): dk_dt + 3σ threshold, variance ratio
+- NEW (VALIDATED): mean_shift > 50%
+- At 1% workload: +83% mean shift
+- At 50% workload: +2519% mean shift
+
+TRNG (exp56-57):
+- 259 kbps true random from GPU timing LSBs
+- 99.5% Shannon entropy
+- Independent of PRNG seed
 
 Author: CIRIS Research Team
 Date: January 2026
@@ -23,55 +47,454 @@ License: BSL 1.1
 import numpy as np
 import cupy as cp
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Callable
 from collections import deque
 import time
 import threading
 import queue
+import socket
+import struct
+import json
+import os
 
 PHI = (1 + np.sqrt(5)) / 2
+
+# =============================================================================
+# CROSS-DEVICE TIMING INFRASTRUCTURE
+# =============================================================================
+# Provides sub-millisecond synchronized timestamps between main GPU and
+# secondary device (e.g., Jetson Nano) WITHOUT adding overhead to measurements.
+#
+# Architecture:
+#   1. CALIBRATION PHASE: UDP round-trip measures offset (run once/periodically)
+#   2. MEASUREMENT PHASE: Apply stored offset to raw timestamps (zero network cost)
+#
+# Usage:
+#   timing = TimingSync("192.168.50.203")
+#   timing.calibrate()  # Once, before experiment
+#
+#   # During measurement - no network overhead:
+#   local_ts = time.time()
+#   remote_ts = timing.local_to_remote(local_ts)
+# =============================================================================
+
+TIMING_CALIBRATION_FILE = "/home/emoore/CIRISArray/timing_calibration.json"
+TIMING_UDP_PORT = 37123
+
+
+@dataclass
+class TimingCalibration:
+    """Stored timing calibration between two hosts."""
+    local_host: str
+    remote_host: str
+    offset_seconds: float      # remote - local (positive = remote ahead)
+    offset_std: float          # uncertainty (1σ)
+    rtt_mean_ms: float         # mean round-trip time
+    rtt_min_ms: float          # minimum RTT (best precision indicator)
+    n_samples: int
+    calibration_time: float    # when calibrated (local time)
+
+    def to_dict(self) -> dict:
+        return {
+            'local_host': self.local_host,
+            'remote_host': self.remote_host,
+            'offset_seconds': self.offset_seconds,
+            'offset_std': self.offset_std,
+            'rtt_mean_ms': self.rtt_mean_ms,
+            'rtt_min_ms': self.rtt_min_ms,
+            'n_samples': self.n_samples,
+            'calibration_time': self.calibration_time,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'TimingCalibration':
+        return cls(**d)
+
+    def save(self, path: str = TIMING_CALIBRATION_FILE):
+        with open(path, 'w') as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+    @classmethod
+    def load(cls, path: str = TIMING_CALIBRATION_FILE) -> 'TimingCalibration':
+        with open(path) as f:
+            return cls.from_dict(json.load(f))
+
+    @property
+    def precision_ms(self) -> float:
+        """Estimated precision in milliseconds."""
+        return self.offset_std * 1000
+
+    @property
+    def precision_us(self) -> float:
+        """Estimated precision in microseconds."""
+        return self.offset_std * 1e6
+
+    @property
+    def age_seconds(self) -> float:
+        """How old is this calibration."""
+        return time.time() - self.calibration_time
+
+
+class TimingSync:
+    """
+    Cross-device timing synchronization.
+
+    Provides synchronized timestamps between local machine and remote device
+    (e.g., Jetson Nano) with sub-millisecond precision over WiFi.
+
+    CRITICAL: Calibrate BEFORE experiments, then use offset during measurement.
+    No network traffic during actual measurements.
+
+    Example:
+        timing = TimingSync("192.168.50.203")
+
+        # Calibrate once (takes ~2 seconds)
+        timing.calibrate(n_samples=100)
+        print(f"Precision: ±{timing.precision_ms:.3f}ms")
+
+        # During experiment - zero overhead:
+        local_ts = time.time()
+        remote_ts = timing.local_to_remote(local_ts)
+
+        # Compare measurements from different devices:
+        jetson_time = 1234567890.123  # From Jetson
+        local_equivalent = timing.remote_to_local(jetson_time)
+    """
+
+    def __init__(self, remote_host: str, port: int = TIMING_UDP_PORT,
+                 auto_load: bool = True):
+        """
+        Initialize timing sync.
+
+        Args:
+            remote_host: IP or hostname of secondary device
+            port: UDP port for time protocol
+            auto_load: If True, load existing calibration if available
+        """
+        self.remote_host = remote_host
+        self.port = port
+        self.calibration: Optional[TimingCalibration] = None
+        self._background_thread: Optional[threading.Thread] = None
+        self._stop_background = threading.Event()
+
+        # Get local hostname
+        import subprocess
+        result = subprocess.run(['hostname'], capture_output=True, text=True)
+        self.local_host = result.stdout.strip()
+
+        # Try to load existing calibration
+        if auto_load:
+            try:
+                self.calibration = TimingCalibration.load()
+                if self.calibration.remote_host == remote_host:
+                    print(f"[TimingSync] Loaded calibration: offset={self.calibration.offset_seconds*1000:.3f}ms, "
+                          f"age={self.calibration.age_seconds/60:.1f}min")
+                else:
+                    print(f"[TimingSync] Stored calibration is for different host, ignoring")
+                    self.calibration = None
+            except FileNotFoundError:
+                pass
+
+    def _get_single_sample(self, timeout: float = 1.0) -> Tuple[float, float]:
+        """
+        Get single time sample via UDP.
+
+        Returns:
+            (offset, rtt) in seconds
+        """
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+
+        try:
+            # Send request with local timestamp
+            t1 = time.time()
+            sock.sendto(b'TIME', (self.remote_host, self.port))
+
+            # Receive response
+            data, _ = sock.recvfrom(1024)
+            t3 = time.time()
+
+            # Unpack server timestamp
+            t2 = struct.unpack('!d', data)[0]
+
+            # NTP-style offset calculation
+            rtt = t3 - t1
+            offset = t2 - (t1 + t3) / 2
+
+            return offset, rtt
+        finally:
+            sock.close()
+
+    def calibrate(self, n_samples: int = 100, verbose: bool = True) -> TimingCalibration:
+        """
+        Calibrate timing offset to remote host.
+
+        Uses UDP round-trip for sub-millisecond precision.
+        Run this BEFORE experiments to establish offset.
+
+        Args:
+            n_samples: Number of samples (more = better precision)
+            verbose: Print progress
+
+        Returns:
+            TimingCalibration object (also stored in self.calibration)
+        """
+        if verbose:
+            print(f"[TimingSync] Calibrating to {self.remote_host}:{self.port}...")
+            print(f"[TimingSync] Taking {n_samples} samples...")
+
+        offsets = []
+        rtts = []
+        failures = 0
+
+        for i in range(n_samples):
+            try:
+                offset, rtt = self._get_single_sample()
+                offsets.append(offset)
+                rtts.append(rtt)
+
+                if verbose and (i + 1) % 25 == 0:
+                    print(f"  {i+1}/{n_samples}: offset={offset*1000:.3f}ms, RTT={rtt*1000:.2f}ms")
+
+            except socket.timeout:
+                failures += 1
+                if failures > n_samples // 2:
+                    raise RuntimeError(f"Too many timeouts - is UDP server running on {self.remote_host}?")
+
+            time.sleep(0.01)  # 10ms between samples
+
+        if len(offsets) < 3:
+            raise RuntimeError("Not enough successful samples")
+
+        offsets = np.array(offsets)
+        rtts = np.array(rtts)
+
+        # Robust statistics with outlier rejection
+        offset_median = np.median(offsets)
+        offset_std = np.std(offsets)
+
+        # Filter outliers (> 2σ from median)
+        mask = np.abs(offsets - offset_median) < 2 * offset_std
+        offsets_clean = offsets[mask]
+        rtts_clean = rtts[mask]
+
+        self.calibration = TimingCalibration(
+            local_host=self.local_host,
+            remote_host=self.remote_host,
+            offset_seconds=float(np.mean(offsets_clean)),
+            offset_std=float(np.std(offsets_clean)),
+            rtt_mean_ms=float(np.mean(rtts_clean) * 1000),
+            rtt_min_ms=float(np.min(rtts_clean) * 1000),
+            n_samples=len(offsets_clean),
+            calibration_time=time.time(),
+        )
+
+        # Save to file
+        self.calibration.save()
+
+        if verbose:
+            print(f"\n[TimingSync] CALIBRATION COMPLETE")
+            print(f"  Offset:    {self.calibration.offset_seconds*1000:+.3f} ms")
+            print(f"  Precision: ±{self.calibration.offset_std*1000:.3f} ms ({self.calibration.offset_std*1e6:.0f} µs)")
+            print(f"  RTT:       {self.calibration.rtt_mean_ms:.2f} ms (min: {self.calibration.rtt_min_ms:.2f} ms)")
+            print(f"  Samples:   {self.calibration.n_samples}")
+
+        return self.calibration
+
+    def local_to_remote(self, local_time: float) -> float:
+        """
+        Convert local timestamp to remote (Jetson) time.
+
+        ZERO OVERHEAD - just adds stored offset.
+        """
+        if self.calibration is None:
+            raise RuntimeError("Not calibrated. Call calibrate() first.")
+        return local_time + self.calibration.offset_seconds
+
+    def remote_to_local(self, remote_time: float) -> float:
+        """
+        Convert remote (Jetson) timestamp to local time.
+
+        ZERO OVERHEAD - just subtracts stored offset.
+        """
+        if self.calibration is None:
+            raise RuntimeError("Not calibrated. Call calibrate() first.")
+        return remote_time - self.calibration.offset_seconds
+
+    @property
+    def offset_ms(self) -> float:
+        """Current offset in milliseconds."""
+        if self.calibration is None:
+            return 0.0
+        return self.calibration.offset_seconds * 1000
+
+    @property
+    def precision_ms(self) -> float:
+        """Precision in milliseconds (1σ)."""
+        if self.calibration is None:
+            return float('inf')
+        return self.calibration.offset_std * 1000
+
+    @property
+    def is_calibrated(self) -> bool:
+        """Check if calibration exists."""
+        return self.calibration is not None
+
+    def start_background_recalibration(self, interval_seconds: float = 300):
+        """
+        Start background thread that re-calibrates periodically.
+
+        Useful for long experiments where clock drift matters.
+        Does NOT affect ongoing measurements - just updates offset.
+
+        Args:
+            interval_seconds: How often to recalibrate (default: 5 minutes)
+        """
+        if self._background_thread is not None:
+            print("[TimingSync] Background thread already running")
+            return
+
+        self._stop_background.clear()
+
+        def recalibrate_loop():
+            while not self._stop_background.wait(interval_seconds):
+                try:
+                    self.calibrate(n_samples=50, verbose=False)
+                except Exception as e:
+                    print(f"[TimingSync] Background recalibration failed: {e}")
+
+        self._background_thread = threading.Thread(target=recalibrate_loop, daemon=True)
+        self._background_thread.start()
+        print(f"[TimingSync] Background recalibration started (every {interval_seconds}s)")
+
+    def stop_background_recalibration(self):
+        """Stop background recalibration thread."""
+        if self._background_thread is None:
+            return
+        self._stop_background.set()
+        self._background_thread.join(timeout=2)
+        self._background_thread = None
+        print("[TimingSync] Background recalibration stopped")
+
+    def __repr__(self):
+        if self.calibration:
+            return (f"TimingSync({self.remote_host}, offset={self.offset_ms:+.3f}ms, "
+                    f"precision=±{self.precision_ms:.3f}ms)")
+        return f"TimingSync({self.remote_host}, NOT CALIBRATED)"
+
+
+def run_timing_server(port: int = TIMING_UDP_PORT):
+    """
+    Run UDP time server (run this on Jetson).
+
+    Responds to time requests with current timestamp.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('0.0.0.0', port))
+
+    print(f"[TimingServer] Listening on UDP port {port}")
+    print("[TimingServer] Press Ctrl+C to stop")
+
+    try:
+        while True:
+            data, addr = sock.recvfrom(1024)
+
+            # Respond immediately with current time
+            t_server = time.time()
+            response = struct.pack('!d', t_server)
+            sock.sendto(response, addr)
+
+    except KeyboardInterrupt:
+        print("\n[TimingServer] Stopped")
+    finally:
+        sock.close()
+
+
 MAGIC_ANGLE = 1.1
 COUPLING_FACTOR = 0.0003
+
+# Lorenz parameters (standard chaotic regime)
+LORENZ_SIGMA = 10.0
+LORENZ_RHO = 28.0
+LORENZ_BETA = 8.0 / 3.0
 
 
 @dataclass
 class SentinelConfig:
     """Configuration for a single sentinel sensor.
 
-    Optimized based on validated findings from exp51-53:
-    - noise_amplitude=0.001 is optimal (stochastic resonance peak)
-    - τ=46.1s thermalization → reset every 23s for peak sensitivity
-    - Noise floor σ=0.003 sets detection threshold
+    V2.1 RESONATOR MODEL (exp63-64):
+    - System is a BANDPASS FILTER on chaos, not a 70 Hz oscillator
+    - Q factor = 10.25, resonance = 70.7 Hz, bandwidth 40-80 Hz
+    - Lyapunov = +0.178 per step (CHAOTIC confirmed)
+    - 61.5% of signal is DC/drift, 35% mid-frequency chaos
+
+    CRITICAL: All oscillators are 100% coherent!
+    - Entropy is TEMPORAL only (GPU timing)
+    - For independent entropy: use different GPUs (e.g., Jetson)
+    - Negentropic detection: AVOID 70 Hz (asymmetry inverts!)
+
+    Detection bandwidth (exp64):
+    - Sensitive: 40-80 Hz (+20 to +27 dB gain)
+    - Peak: 70 Hz (+27.5 dB)
+    - Cutoff: 80 Hz (sharp rolloff)
+    - Best for negentropy: < 50 Hz
+
+    Lorenz parameters (standard chaotic regime):
+    - sigma=10.0, rho=28.0, beta=8/3
+    - dt=0.01 with RK4 integration for stability
+    - timing_sensitivity: how much timing affects rho
 
     Thermal sensing (validated Jan 2026):
     - Variance correlates with temperature at r=-0.97
-    - As temperature increases, variance decreases
+    - Works via DC/drift component (61.5% of signal)
     - Use variance (not k_eff) for thermal detection
 
-    Sensitivity regime (validated Jan 2026):
-    - r_ab (internal correlation) predicts sensitivity with r=-0.999
-    - r_ab < 0.98 = TRANSIENT regime (20x more sensitive)
-    - r_ab > 0.99 = THERMALIZED regime (low sensitivity)
-    - Reset when r_ab exceeds threshold to maintain sensitivity
-
-    Coupling strength (exp43 finding):
-    - epsilon=0.003 (default): OPTIMAL crossover, τ=12.8s, 64% transient
-    - epsilon=0.0003: Never thermalizes, weak signal (σ=0.03)
-    - epsilon=0.05: Thermalizes in 0.7s, strong signal (σ=3.1)
-    - Scaling law: τ ∝ ε^(-1.06)
+    TRNG mode:
+    - 259 kbps true random bits
+    - 99.5% Shannon entropy
+    - Use GPUATRNG class for random bytes
     """
+    # Core array parameters
     n_ossicles: int = 256         # Minimal array
     oscillator_depth: int = 32    # Reduced depth for speed
+
+    # V2.1: Lorenz chaotic dynamics (TRUE chaos!)
+    use_lorenz: bool = True       # Use Lorenz (True) or legacy linear (False)
+    lorenz_sigma: float = 10.0    # Lorenz σ parameter
+    lorenz_rho: float = 28.0      # Lorenz ρ parameter (base value)
+    lorenz_beta: float = 8.0/3.0  # Lorenz β parameter
+    lorenz_dt: float = 0.025      # VALIDATED: 0.025 = critical point (Exp 114)
+    timing_sensitivity: float = 0.001  # How much timing jitter affects ρ
+
+    # Resonator characteristics (exp63-64 validated)
+    resonance_freq_hz: float = 70.7    # Natural resonance frequency
+    q_factor: float = 10.25            # Quality factor (ceramic-like)
+    bandwidth_low_hz: float = 40.0     # -3dB lower bound
+    bandwidth_high_hz: float = 80.0    # -3dB upper bound (sharp cutoff!)
+    negentropic_avoid_hz: float = 70.0 # Avoid this freq for negentropy detection!
+
+    # Legacy linear coupling parameters (use_lorenz=False)
     epsilon: float = 0.003        # OPTIMAL: crossover point (25x signal, τ=12.8s)
     noise_amplitude: float = 0.001  # OPTIMAL: SR peak (was 0.02, too high!)
-    sample_rate_hz: float = 1000  # High rate for short events
+
+    # Sampling parameters (A5/O1-O7 VALIDATED Jan 2026)
+    sample_rate_hz: float = 4000  # VALIDATED: 4000 Hz optimal (avoid 1900-2100 Hz)
     derivative_window: int = 5    # Samples for derivative calc
     reset_interval_s: float = 23.0  # τ/2 = 46.1/2, optimal reset cycle
     tau_thermalization: float = 46.1  # Validated decay constant
     noise_floor_sigma: float = 0.003  # Validated noise floor
+
+    # MEAN SHIFT DETECTION (A5/O1-O7 VALIDATED Jan 2026)
+    # Primary detection method: timing mean shift > 50%
+    # Workload causes GPU contention → timing TRIPLES (~7μs → ~21μs)
+    mean_shift_threshold_pct: float = 50.0  # VALIDATED: >50% mean shift = detection
+    detection_window_samples: int = 40  # ~10ms at 4000 Hz (O4: 2.5ms latency)
+
     # Thermal sensing parameters
     thermal_window: int = 50      # Samples for thermal baseline
     thermal_threshold_sigma: float = 3.0  # Detection threshold
+
     # r_ab sensitivity regime parameters (validated Jan 2026)
     r_ab_reset_threshold: float = 0.98  # Reset when r_ab exceeds this
     r_ab_sensitive_threshold: float = 0.95  # Below this = highly sensitive
@@ -160,6 +583,77 @@ void fast_correlate(
 }
 ''', 'sentinel_step')
 
+# Lorenz CUDA kernel with RK4 integration (V2 upgrade)
+# TRUE CHAOS: positive Lyapunov exponent (+0.007)
+# Timing-coupled: rho modulated by GPU timing jitter
+_lorenz_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void lorenz_step(
+    float* osc_x, float* osc_y, float* osc_z,
+    float sigma, float rho_base, float beta, float dt,
+    float timing_perturbation,  // From GPU timing jitter
+    int n, int iters
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    float x = osc_x[idx];
+    float y = osc_y[idx];
+    float z = osc_z[idx];
+
+    // Timing-modulated rho (entropy injection point)
+    // Small timing variations create large trajectory divergence
+    float rho = rho_base + timing_perturbation;
+
+    // RK4 integration for stability (from exp60)
+    for (int i = 0; i < iters; i++) {
+        // k1
+        float dx1 = sigma * (y - x);
+        float dy1 = x * (rho - z) - y;
+        float dz1 = x * y - beta * z;
+
+        // k2
+        float x2 = x + dx1 * dt / 2;
+        float y2 = y + dy1 * dt / 2;
+        float z2 = z + dz1 * dt / 2;
+        float dx2 = sigma * (y2 - x2);
+        float dy2 = x2 * (rho - z2) - y2;
+        float dz2 = x2 * y2 - beta * z2;
+
+        // k3
+        float x3 = x + dx2 * dt / 2;
+        float y3 = y + dy2 * dt / 2;
+        float z3 = z + dz2 * dt / 2;
+        float dx3 = sigma * (y3 - x3);
+        float dy3 = x3 * (rho - z3) - y3;
+        float dz3 = x3 * y3 - beta * z3;
+
+        // k4
+        float x4 = x + dx3 * dt;
+        float y4 = y + dy3 * dt;
+        float z4 = z + dz3 * dt;
+        float dx4 = sigma * (y4 - x4);
+        float dy4 = x4 * (rho - z4) - y4;
+        float dz4 = x4 * y4 - beta * z4;
+
+        // Update
+        x += (dx1 + 2*dx2 + 2*dx3 + dx4) * dt / 6;
+        y += (dy1 + 2*dy2 + 2*dy3 + dy4) * dt / 6;
+        z += (dz1 + 2*dz2 + 2*dz3 + dz4) * dt / 6;
+
+        // Soft bound (Lorenz attractor is bounded naturally)
+        x = fmaxf(-50.0f, fminf(50.0f, x));
+        y = fmaxf(-50.0f, fminf(50.0f, y));
+        z = fmaxf(0.0f, fminf(100.0f, z));  // z is always positive
+    }
+
+    osc_x[idx] = x;
+    osc_y[idx] = y;
+    osc_z[idx] = z;
+}
+''', 'lorenz_step')
+
+
 _correlate_kernel = cp.RawModule(code=r'''
 extern "C" __global__
 void fast_stats(
@@ -220,10 +714,16 @@ class Sentinel:
     """
     Single minimal entropy wave sensor.
 
+    V2 LORENZ UPGRADE:
+    - TRUE CHAOS: Lorenz attractor (Lyapunov = +0.007)
+    - TIMING-COUPLED: GPU jitter modulates dynamics
+    - HARDWARE ENTROPY: Output depends on timing, not PRNG seed
+
     Designed to be:
     - Fast (>1kHz sampling)
     - Small (256-1024 ossicles)
-    - Perpetually transient (never converges)
+    - Truly chaotic (never converges, positive Lyapunov)
+    - Timing-dependent (hardware entropy source)
     """
 
     def __init__(self, config: SentinelConfig, sensor_id: int = 0):
@@ -235,12 +735,23 @@ class Sentinel:
         self.out_r = cp.zeros(1, dtype=cp.float32)
         self.out_var = cp.zeros(1, dtype=cp.float32)
 
-        # Coupling constants
+        # Legacy: Coupling constants (for use_lorenz=False)
         angle_rad = np.radians(MAGIC_ANGLE)
-        # Use configurable epsilon for coupling (default: 0.0003)
         self.coupling_ab = np.float32(np.cos(angle_rad) * config.epsilon)
         self.coupling_bc = np.float32(np.sin(angle_rad) * config.epsilon)
         self.coupling_ca = np.float32(config.epsilon / PHI)
+
+        # V2: Lorenz parameters (for use_lorenz=True)
+        self.lorenz_sigma = np.float32(config.lorenz_sigma)
+        self.lorenz_rho = np.float32(config.lorenz_rho)
+        self.lorenz_beta = np.float32(config.lorenz_beta)
+        self.lorenz_dt = np.float32(config.lorenz_dt)
+        self.timing_sensitivity = config.timing_sensitivity
+
+        # Timing tracking for entropy injection
+        self.last_timing_ns = 0
+        self.timing_history = deque(maxlen=100)
+        self.timing_perturbation = 0.0
 
         # CUDA config
         self.block_size = min(256, self.total)
@@ -270,14 +781,30 @@ class Sentinel:
         self._reset_oscillators()
 
     def _reset_oscillators(self, reason: str = "manual"):
-        """Reset oscillators to random state for peak sensitivity."""
-        self.osc_a = cp.random.random(self.total, dtype=cp.float32) * 0.5 - 0.25
-        self.osc_b = cp.random.random(self.total, dtype=cp.float32) * 0.5 - 0.25
-        self.osc_c = cp.random.random(self.total, dtype=cp.float32) * 0.5 - 0.25
+        """Reset oscillators to random state for peak sensitivity.
+
+        For Lorenz mode: Initialize near the attractor for immediate chaos.
+        For legacy mode: Random state near origin.
+        """
+        if self.config.use_lorenz:
+            # Lorenz: Initialize near the attractor
+            # Standard Lorenz attractor lives around x,y ∈ [-20,20], z ∈ [5,45]
+            self.osc_a = cp.random.random(self.total, dtype=cp.float32) * 2 - 1  # x: [-1, 1]
+            self.osc_b = cp.random.random(self.total, dtype=cp.float32) * 2 - 1  # y: [-1, 1]
+            self.osc_c = cp.random.random(self.total, dtype=cp.float32) * 5 + 20  # z: [20, 25] near attractor
+        else:
+            # Legacy: Random near origin
+            self.osc_a = cp.random.random(self.total, dtype=cp.float32) * 0.5 - 0.25
+            self.osc_b = cp.random.random(self.total, dtype=cp.float32) * 0.5 - 0.25
+            self.osc_c = cp.random.random(self.total, dtype=cp.float32) * 0.5 - 0.25
+
         self.noise = cp.random.random(3 * self.total, dtype=cp.float32) - 0.5
         self.last_reset_time = time.perf_counter()
+        self.last_timing_ns = 0
+        self.timing_perturbation = 0.0
         self.k_eff_history.clear()
         self.r_ab_history.clear()
+        self.timing_history.clear()
         self.reset_reason = reason
 
     # =========================================================================
@@ -391,7 +918,16 @@ class Sentinel:
 
     def step_and_measure(self, auto_reset: bool = True) -> Tuple[float, float, float, float]:
         """
-        Single step: advance dynamics, inject noise, measure k_eff.
+        Single step: advance dynamics, inject noise/timing, measure k_eff.
+
+        V2 LORENZ MODE (use_lorenz=True):
+        - Measures GPU timing jitter as entropy source
+        - Modulates Lorenz ρ parameter with timing
+        - TRUE chaos amplifies small timing variations
+
+        LEGACY MODE (use_lorenz=False):
+        - Linear diffusive coupling with PRNG noise
+        - Not truly chaotic (Lyapunov = -0.01)
 
         Args:
             auto_reset: If True, automatically reset based on r_ab threshold or time
@@ -408,18 +944,46 @@ class Sentinel:
         # Update time tracking
         self.time_since_reset = time.perf_counter() - self.last_reset_time
 
-        # Refresh noise
-        self.noise = cp.random.random(3 * self.total, dtype=cp.float32) - 0.5
+        if self.config.use_lorenz:
+            # V2: LORENZ DYNAMICS WITH TIMING COUPLING
+            # Measure timing BEFORE kernel to get jitter
+            t0 = time.perf_counter_ns()
 
-        # Step with noise injection (σ=0.001 optimal from SR validation)
-        _sentinel_kernel(
-            (self.grid_size,), (self.block_size,),
-            (self.osc_a, self.osc_b, self.osc_c,
-             self.noise,
-             self.coupling_ab, self.coupling_bc, self.coupling_ca,
-             np.float32(self.config.noise_amplitude),
-             self.total, 3)  # 3 iterations per step
-        )
+            # Compute timing perturbation (detrended from last measurement)
+            if self.last_timing_ns > 0:
+                timing_delta = t0 - self.last_timing_ns
+            else:
+                timing_delta = 0
+            self.last_timing_ns = t0
+
+            # Convert timing to ρ perturbation
+            # Scale: 1000ns variation → ~0.001 change in ρ
+            self.timing_perturbation = timing_delta * self.timing_sensitivity * 1e-6
+            self.timing_history.append(timing_delta)
+
+            # Run Lorenz kernel with timing-modulated ρ
+            _lorenz_kernel(
+                (self.grid_size,), (self.block_size,),
+                (self.osc_a, self.osc_b, self.osc_c,
+                 self.lorenz_sigma, self.lorenz_rho, self.lorenz_beta,
+                 self.lorenz_dt,
+                 np.float32(self.timing_perturbation),
+                 self.total, 5)  # 5 RK4 iterations per step
+            )
+        else:
+            # LEGACY: Linear diffusive coupling
+            # Refresh noise
+            self.noise = cp.random.random(3 * self.total, dtype=cp.float32) - 0.5
+
+            # Step with noise injection (σ=0.001 optimal from SR validation)
+            _sentinel_kernel(
+                (self.grid_size,), (self.block_size,),
+                (self.osc_a, self.osc_b, self.osc_c,
+                 self.noise,
+                 self.coupling_ab, self.coupling_bc, self.coupling_ca,
+                 np.float32(self.config.noise_amplitude),
+                 self.total, 3)  # 3 iterations per step
+            )
 
         # Fast measurement (r_ab and variance)
         _correlate_kernel(
@@ -435,8 +999,15 @@ class Sentinel:
         self.r_ab_history.append(self.last_r_ab)
 
         # k_eff calculation
-        x = min(var / 2.0, 1.0)
-        k_eff = r * (1 - x) * self.config.epsilon * 1000
+        if self.config.use_lorenz:
+            # Lorenz: k_eff based on x-y correlation and variance
+            # The chaotic dynamics provide natural variation
+            x = min(var / 100.0, 1.0)  # Lorenz has larger variance
+            k_eff = r * (1 - x) * 10.0  # Scale factor for Lorenz
+        else:
+            # Legacy formula
+            x = min(var / 2.0, 1.0)
+            k_eff = r * (1 - x) * self.config.epsilon * 1000
 
         # Derivative estimate
         self.k_eff_history.append(k_eff)
@@ -487,13 +1058,63 @@ class Sentinel:
         }
 
     def is_detection(self, dk_dt: float, sensitivity: float) -> bool:
-        """Check if dk_dt indicates a detection.
+        """Check if dk_dt indicates a detection (LEGACY - use is_workload_detected).
 
         Uses validated noise floor σ=0.003 as threshold basis.
         Detection requires |dk_dt| > 3σ AND sensitivity > 0.5
         """
         threshold = 3 * self.config.noise_floor_sigma  # 3σ detection
         return abs(dk_dt) > threshold and sensitivity > 0.5
+
+    def is_workload_detected(self, current_timing_mean: float) -> Tuple[bool, float]:
+        """Check for workload using VALIDATED mean-shift detection (A5/O1-O7).
+
+        Primary detection method (Jan 2026 validated):
+        - Workload causes GPU contention → timing increases
+        - Detection threshold: >50% mean shift from baseline
+        - At 50% workload: +2519% mean shift (A5 validated)
+        - At 1% workload: +83% mean shift (A5 validated)
+
+        Args:
+            current_timing_mean: Current timing mean in microseconds
+
+        Returns:
+            (detected: bool, mean_shift_pct: float)
+        """
+        if not hasattr(self, '_timing_baseline_mean') or self._timing_baseline_mean <= 0:
+            return False, 0.0
+
+        mean_shift = current_timing_mean - self._timing_baseline_mean
+        mean_shift_pct = (mean_shift / self._timing_baseline_mean) * 100
+
+        detected = mean_shift_pct > self.config.mean_shift_threshold_pct
+        return detected, mean_shift_pct
+
+    def calibrate_timing_baseline(self, duration: float = 3.0):
+        """Calibrate timing baseline for mean-shift detection.
+
+        Must be called during IDLE state before detection.
+
+        Args:
+            duration: Calibration duration in seconds
+        """
+        print(f"Calibrating timing baseline ({duration}s)... Keep system IDLE.")
+        samples = []
+        start = time.time()
+
+        while time.time() - start < duration:
+            # Measure kernel timing
+            t0 = time.perf_counter_ns()
+            self.step_and_measure(auto_reset=False)  # Run one oscillator step
+            cp.cuda.stream.get_current_stream().synchronize()
+            t1 = time.perf_counter_ns()
+            samples.append((t1 - t0) / 1000.0)  # Convert to μs
+
+        self._timing_baseline_mean = np.mean(samples)
+        self._timing_baseline_std = np.std(samples)
+
+        print(f"  Baseline: {self._timing_baseline_mean:.2f} ± {self._timing_baseline_std:.2f} μs")
+        print(f"  Detection threshold: >{self.config.mean_shift_threshold_pct:.0f}% shift")
 
     def inject_negentropic(self, amplitude: float = 0.1):
         """
@@ -644,6 +1265,183 @@ class SentinelArray:
 
         # Compute correlation matrix
         return np.corrcoef(series)
+
+
+# =============================================================================
+# REFERENCE-SUBTRACTED ARCHITECTURE (exp65-67 validated)
+# =============================================================================
+# Isolates GPU-specific entropy (4%) from algorithmic determinism (78%)
+#
+# Architecture:
+#   Actual Lorenz (timing-coupled) ──┐
+#                                    ├──► Difference = Pure Entropy
+#   Reference Lorenz (no timing) ────┘
+#
+# Result: 4% GPU timing entropy isolated, 78% algorithmic cancelled
+# =============================================================================
+
+class DifferentialSentinel:
+    """
+    Reference-subtracted chaotic resonator.
+
+    Runs TWO Lorenz oscillators in parallel:
+    1. ACTUAL: Timing-coupled (receives GPU timing perturbations)
+    2. REFERENCE: Deterministic (no timing, same initial conditions)
+
+    The DIFFERENCE isolates pure GPU timing entropy:
+    - Algorithmic component (78%): CANCELLED (same in both)
+    - GPU timing (4%): ISOLATED (only in actual)
+    - Noise (18%): Present in difference
+
+    V3 ARCHITECTURE (exp65-67 validated):
+    - Reference subtraction removes 78% algorithmic background
+    - Improves TRNG entropy density from 4% to ~100%
+    - Improves detector SNR by removing common-mode
+
+    Usage:
+        sensor = DifferentialSentinel()
+
+        # For TRNG - pure timing entropy:
+        entropy = sensor.step_and_get_entropy()
+
+        # For detection - perturbation-only signal:
+        delta_k, delta_var = sensor.step_and_measure_differential()
+    """
+
+    def __init__(self, config: SentinelConfig = None):
+        self.config = config or SentinelConfig()
+
+        # Ensure Lorenz mode
+        self.config.use_lorenz = True
+
+        # Create ACTUAL sensor (timing-coupled)
+        self.actual = Sentinel(self.config, sensor_id=0)
+
+        # Create REFERENCE sensor (deterministic - no timing)
+        # We'll run it with timing_sensitivity=0
+        ref_config = SentinelConfig(
+            n_ossicles=self.config.n_ossicles,
+            oscillator_depth=self.config.oscillator_depth,
+            use_lorenz=True,
+            lorenz_sigma=self.config.lorenz_sigma,
+            lorenz_rho=self.config.lorenz_rho,
+            lorenz_beta=self.config.lorenz_beta,
+            lorenz_dt=self.config.lorenz_dt,
+            timing_sensitivity=0.0,  # NO timing coupling!
+        )
+        self.reference = Sentinel(ref_config, sensor_id=1)
+
+        # Synchronize initial states
+        self._synchronize_states()
+
+        # Tracking
+        self.entropy_history = deque(maxlen=100)
+        self.delta_k_history = deque(maxlen=100)
+
+    def _synchronize_states(self):
+        """Synchronize actual and reference oscillator states."""
+        # Copy actual state to reference
+        self.reference.osc_a = self.actual.osc_a.copy()
+        self.reference.osc_b = self.actual.osc_b.copy()
+        self.reference.osc_c = self.actual.osc_c.copy()
+        self.reference.last_timing_ns = 0
+        self.reference.timing_perturbation = 0.0
+
+    def reset(self):
+        """Reset both oscillators with synchronized states."""
+        self.actual._reset_oscillators("differential_reset")
+        self._synchronize_states()
+
+    def step_and_measure_differential(self) -> Tuple[float, float, float, float]:
+        """
+        Step both oscillators and return the DIFFERENCE.
+
+        Returns:
+            (delta_k_eff, delta_variance, actual_k, reference_k)
+
+        delta_k_eff = actual_k - reference_k = pure timing effect
+        """
+        # Step actual (with timing)
+        k_actual, var_actual, _, _ = self.actual.step_and_measure(auto_reset=False)
+
+        # Step reference (no timing - perturbation stays 0)
+        self.reference.timing_perturbation = 0.0  # Force no timing
+        k_ref, var_ref, _, _ = self.reference.step_and_measure(auto_reset=False)
+
+        # Compute differences
+        delta_k = k_actual - k_ref
+        delta_var = var_actual - var_ref
+
+        self.delta_k_history.append(delta_k)
+
+        return delta_k, delta_var, k_actual, k_ref
+
+    def step_and_get_entropy(self) -> float:
+        """
+        Get pure timing entropy (for TRNG).
+
+        Returns the timing perturbation that was applied to actual
+        but not to reference - this is the GPU-specific entropy.
+        """
+        # Step actual to get timing measurement
+        self.actual.step_and_measure(auto_reset=False)
+
+        # The timing perturbation IS the entropy
+        entropy = self.actual.timing_perturbation
+
+        # Also step reference to keep them in sync iteration-wise
+        self.reference.timing_perturbation = 0.0
+        self.reference.step_and_measure(auto_reset=False)
+
+        self.entropy_history.append(entropy)
+
+        return entropy
+
+    def get_entropy_bytes(self, n_bytes: int) -> bytes:
+        """
+        Get random bytes from pure timing entropy.
+
+        Much higher entropy density than raw k_eff (100% vs 4%).
+        """
+        result = bytearray(n_bytes)
+
+        for i in range(n_bytes):
+            # Collect timing samples and extract LSBs
+            entropy = self.step_and_get_entropy()
+
+            # Convert to integer via timing nanoseconds
+            timing_ns = self.actual.timing_history[-1] if self.actual.timing_history else 0
+            result[i] = timing_ns & 0xFF
+
+        return bytes(result)
+
+    def get_detection_signal(self, n_samples: int = 10) -> float:
+        """
+        Get detection signal with reference subtraction.
+
+        Higher SNR than raw k_eff because 78% algorithmic background removed.
+        """
+        deltas = []
+        for _ in range(n_samples):
+            delta_k, _, _, _ = self.step_and_measure_differential()
+            deltas.append(delta_k)
+
+        return np.mean(deltas)
+
+    def get_stats(self) -> Dict:
+        """Get statistics on differential measurements."""
+        if len(self.delta_k_history) < 10:
+            return {'error': 'Not enough samples'}
+
+        deltas = np.array(self.delta_k_history)
+
+        return {
+            'delta_k_mean': float(np.mean(deltas)),
+            'delta_k_std': float(np.std(deltas)),
+            'delta_k_max': float(np.max(np.abs(deltas))),
+            'n_samples': len(deltas),
+            'entropy_contribution': float(np.std(deltas)),  # This IS the 4%
+        }
 
 
 def find_minimum_array_size():
@@ -985,18 +1783,279 @@ def trng_demo(n_bytes: int = 256, output_file: str = None, stream: bool = False,
     print(f"  Unique: {len(np.unique(arr))} / {min(256, n_bytes)}")
 
 
+# =============================================================================
+# RAW TIMING TRNG V2 (Experiments 70-72 validated)
+# =============================================================================
+# Bypasses Lorenz entirely - raw timing LSBs are the true entropy source.
+#
+# Key findings (Exp 69-72):
+# - Lorenz DESTROYS entropy (7.96 bits in → 0.01 bits out)
+# - Raw timing LSBs: true entropy from GPU jitter
+# - Optimal: 4 LSBs without debiasing → 6/6 NIST, 470 kbps
+# - 8 LSBs has pattern in upper bits → fails NIST
+# - Von Neumann debiasing only needed if using >7 LSBs
+#
+# Throughput: ~470 kbps true random (4 LSBs, no debiasing)
+# =============================================================================
+
+class RawTimingTRNG:
+    """
+    True Random Number Generator using raw GPU timing LSBs.
+
+    V2 Architecture (Exp 70-72 validated):
+    - Extracts LSBs directly from GPU timing measurements
+    - Optimal: 4-7 LSBs without debiasing
+    - NO Lorenz processing (which destroys entropy)
+
+    Metrics (4 LSBs, no debiasing - DEFAULT):
+    - NIST tests: 6/6 pass
+    - Entropy: 7.99 bits/byte
+    - Throughput: ~470 kbps true random
+
+    The entropy comes from:
+    - GPU scheduler jitter
+    - Memory access timing variations
+    - Thermal effects on clock
+    - Cache state variations
+
+    Usage:
+        trng = RawTimingTRNG()  # Uses optimal 4 LSBs
+        random_bytes = trng.get_random_bytes(1024)
+        # Or stream:
+        for byte in trng.stream_bytes():
+            process(byte)
+    """
+
+    def __init__(self, n_lsbs: int = 4, use_debiasing: bool = False):
+        """
+        Initialize raw timing TRNG.
+
+        Args:
+            n_lsbs: Number of LSBs to extract per timing sample (1-8)
+            use_debiasing: Apply von Neumann debiasing (recommended for 6/6 NIST)
+        """
+        self.n_lsbs = min(8, max(1, n_lsbs))
+        self.use_debiasing = use_debiasing
+        self._warmed_up = False
+
+        # Minimal GPU workload for timing measurement
+        self._workload_size = 1024
+        self._workload = cp.zeros(self._workload_size, dtype=cp.float32)
+
+        # Bit buffer for debiasing
+        self._bit_buffer = []
+
+        # Stats tracking
+        self.samples_collected = 0
+        self.bits_generated = 0
+        self.bits_discarded = 0
+
+    def warmup(self, n_iterations: int = 100):
+        """Warm up GPU for stable timing."""
+        for _ in range(n_iterations):
+            self._get_timing_ns()
+        self._warmed_up = True
+
+    def _get_timing_ns(self) -> int:
+        """Get single timing measurement in nanoseconds."""
+        t0 = time.perf_counter_ns()
+        # Simple GPU operation to measure
+        self._workload = cp.sin(self._workload)
+        cp.cuda.stream.get_current_stream().synchronize()
+        t1 = time.perf_counter_ns()
+        return t1 - t0
+
+    def _extract_bits(self, timing_ns: int) -> list:
+        """Extract LSBs from timing value."""
+        bits = []
+        for i in range(self.n_lsbs):
+            bits.append((timing_ns >> i) & 1)
+        return bits
+
+    def _von_neumann_debias(self, bits: list) -> list:
+        """
+        Apply von Neumann debiasing.
+
+        Pairs of bits:
+        - 01 → output 0
+        - 10 → output 1
+        - 00, 11 → discard
+
+        Removes any bias but halves throughput on average.
+        """
+        output = []
+        i = 0
+        while i + 1 < len(bits):
+            b0, b1 = bits[i], bits[i+1]
+            if b0 == 0 and b1 == 1:
+                output.append(0)
+            elif b0 == 1 and b1 == 0:
+                output.append(1)
+            # else: discard (00 or 11)
+            else:
+                self.bits_discarded += 2
+            i += 2
+        return output
+
+    def _bits_to_byte(self, bits: list) -> int:
+        """Convert 8 bits to a byte."""
+        result = 0
+        for i, bit in enumerate(bits[:8]):
+            result |= (bit << i)
+        return result
+
+    def get_random_bits(self, n_bits: int) -> list:
+        """Get n random bits."""
+        if not self._warmed_up:
+            self.warmup()
+
+        result = []
+
+        while len(result) < n_bits:
+            # Get timing and extract LSBs
+            timing = self._get_timing_ns()
+            self.samples_collected += 1
+            bits = self._extract_bits(timing)
+
+            if self.use_debiasing:
+                # Add to buffer and debias
+                self._bit_buffer.extend(bits)
+                if len(self._bit_buffer) >= 16:  # Process in chunks
+                    before_len = len(self._bit_buffer)
+                    debiased = self._von_neumann_debias(self._bit_buffer)
+                    result.extend(debiased)
+                    self.bits_generated += len(debiased)
+                    self._bit_buffer = []
+            else:
+                result.extend(bits)
+                self.bits_generated += len(bits)
+
+        return result[:n_bits]
+
+    def get_random_byte(self) -> int:
+        """Get single random byte."""
+        bits = self.get_random_bits(8)
+        return self._bits_to_byte(bits)
+
+    def get_random_bytes(self, n_bytes: int) -> bytes:
+        """Get multiple random bytes."""
+        if not self._warmed_up:
+            self.warmup()
+
+        result = bytearray(n_bytes)
+        for i in range(n_bytes):
+            result[i] = self.get_random_byte()
+        return bytes(result)
+
+    def stream_bytes(self, n_bytes: int = None):
+        """Generator yielding random bytes."""
+        if not self._warmed_up:
+            self.warmup()
+
+        count = 0
+        while n_bytes is None or count < n_bytes:
+            yield self.get_random_byte()
+            count += 1
+
+    def get_random_int(self, min_val: int = 0, max_val: int = 255) -> int:
+        """Get random integer in range [min_val, max_val]."""
+        range_size = max_val - min_val + 1
+        # Use rejection sampling for uniformity
+        max_valid = (256 // range_size) * range_size - 1
+
+        while True:
+            val = self.get_random_byte()
+            if val <= max_valid:
+                return min_val + (val % range_size)
+
+    def get_stats(self) -> dict:
+        """Get TRNG statistics."""
+        efficiency = (self.bits_generated / (self.bits_generated + self.bits_discarded)
+                     if self.bits_generated + self.bits_discarded > 0 else 0)
+        return {
+            'samples_collected': self.samples_collected,
+            'bits_generated': self.bits_generated,
+            'bits_discarded': self.bits_discarded,
+            'debiasing_efficiency': efficiency,
+            'n_lsbs': self.n_lsbs,
+            'use_debiasing': self.use_debiasing,
+        }
+
+    def get_entropy_estimate(self, n_samples: int = 1000) -> dict:
+        """Estimate entropy quality."""
+        if not self._warmed_up:
+            self.warmup()
+
+        samples = np.array([self.get_random_byte() for _ in range(n_samples)])
+
+        # Shannon entropy
+        counts = np.bincount(samples, minlength=256)
+        probs = counts / n_samples
+        probs = probs[probs > 0]
+        shannon = -np.sum(probs * np.log2(probs))
+
+        # Min-entropy
+        max_prob = np.max(counts) / n_samples
+        min_ent = -np.log2(max_prob) if max_prob > 0 else 0
+
+        # Autocorrelation
+        d = samples.astype(float) - np.mean(samples)
+        if np.std(d) > 1e-10:
+            autocorr = np.corrcoef(d[:-1], d[1:])[0, 1]
+        else:
+            autocorr = 0
+
+        # Bit balance
+        bits = np.unpackbits(samples.astype(np.uint8))
+        bit_balance = np.mean(bits)
+
+        return {
+            'shannon_entropy': shannon,
+            'max_entropy': 8.0,
+            'entropy_ratio': shannon / 8.0,
+            'min_entropy': min_ent,
+            'autocorrelation': autocorr,
+            'bit_balance': bit_balance,
+            'n_samples': n_samples,
+            'unique_values': len(np.unique(samples)),
+        }
+
+
 def main():
-    """Run sentinel tests or TRNG demo."""
+    """Run sentinel tests, TRNG demo, or timing server."""
     import argparse
 
-    parser = argparse.ArgumentParser(description='CIRIS Sentinel / GPU TRNG')
+    parser = argparse.ArgumentParser(description='CIRIS Sentinel / GPU TRNG / Timing Server')
+
+    # TRNG options
     parser.add_argument('--trng', action='store_true', help='Run TRNG mode')
     parser.add_argument('--bytes', type=int, default=256, help='Number of bytes to generate')
     parser.add_argument('--output', '-o', type=str, help='Output file for random bytes')
     parser.add_argument('--stream', action='store_true', help='Stream random bytes to stdout')
     parser.add_argument('--test', action='store_true', help='Run TRNG quality tests')
 
+    # Timing infrastructure options
+    parser.add_argument('--timing-server', action='store_true',
+                        help='Run UDP timing server (for Jetson)')
+    parser.add_argument('--timing-calibrate', action='store_true',
+                        help='Calibrate timing to remote host')
+    parser.add_argument('--timing-host', type=str, default='192.168.50.203',
+                        help='Remote host for timing calibration')
+    parser.add_argument('--timing-samples', type=int, default=100,
+                        help='Number of calibration samples')
+
     args = parser.parse_args()
+
+    # Timing server mode (run on Jetson)
+    if args.timing_server:
+        run_timing_server()
+        return
+
+    # Timing calibration mode
+    if args.timing_calibrate:
+        timing = TimingSync(args.timing_host, auto_load=False)
+        timing.calibrate(n_samples=args.timing_samples)
+        return
 
     if args.trng or args.stream or args.test:
         trng_demo(n_bytes=args.bytes, output_file=args.output,

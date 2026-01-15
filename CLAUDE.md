@@ -50,11 +50,14 @@ CIRISArray extends [CIRISOssicle](https://github.com/CIRISAI/CIRISOssicle) to ma
     │   8.2 million samples/sec total bandwidth      │
     └─────────────────────────────────────────────────┘
 
-    Detects:
+    VALIDATED:
+    - GPU workload detection (mean shift method)
+
+    THEORIZED (NOT VALIDATED):
     - Thermal diffusion waves (~0.1 m/s)
-    - PDN resonance patterns
+    - EMI/PDN resonance patterns
+    - VFD interference detection
     - Coherence fronts (entropy boundaries)
-    - Load propagation waves
 ```
 
 ## Relationship to CIRISOssicle
@@ -143,33 +146,40 @@ Clear gradient visible: wave propagation is imageable!
 | `experiments/expE2_delta_rho_ci.py` | Δρ confidence interval (30 trials) |
 | `experiments/expE3_velocity_discrepancy.py` | Velocity non-thermal (PDN/scheduler) |
 | `experiments/expE4_collapse_threshold.py` | Operational collapse threshold (k_eff < 4) |
+| `experiments/expF1_velocity_mechanism.py` | Velocity mechanism test (INCONCLUSIVE) |
+| `experiments/expF2_causality_test.py` | ρ → fragility causality (INCONCLUSIVE) |
 | `PHYSICS_VALIDATION_REPORT.md` | Detailed physics test results |
 | `~/RATCHET/experiments/exp27_ossicle_array_thermal.py` | Array thermal detection |
 | [CIRISOssicle experiments](https://github.com/CIRISAI/CIRISOssicle/tree/main/experiments) | Single ossicle crypto detection |
 
 ## Physics
 
-### Wave Types Detectable
+### Wave Types (THEORIZED - NOT VALIDATED)
 
-1. **Thermal Diffusion** (~0.1 m/s)
+> **Note:** The following wave types are theoretical. Only **workload detection** via mean-shift
+> has been validated. Temperature, EMI, and VFD detection modes showed inconsistent/random
+> frequency peaks in testing (Jan 2026) and should be considered unproven hypotheses.
+
+1. **Thermal Diffusion** (~0.1 m/s) - *NOT VALIDATED*
    - Heat spreading from compute hotspots
    - Slow, easily tracked spatially
    - Signature: Negentropic strain (order spreading)
 
-2. **PDN Resonance** (~10⁸ m/s)
+2. **PDN Resonance** (~10⁸ m/s) - *NOT VALIDATED*
    - Standing waves in power delivery
    - Too fast for temporal tracking, spatial patterns visible
    - Signature: Periodic entropic/negentropic oscillation
 
-3. **Coherence Fronts** (estimated 10³-10⁶ m/s)
+3. **Coherence Fronts** (estimated 10³-10⁶ m/s) - *NOT VALIDATED*
    - Propagating entropy boundaries from tampering
    - PRIMARY DETECTION TARGET
    - Signature: Sharp entropic wavefront
 
-4. **Load Waves** (~10⁹ m/s)
+4. **Load Waves** (~10⁹ m/s) - *PARTIALLY VALIDATED*
    - Compute load spreading across SMs
    - Near speed of light
    - Signature: Correlated k_eff shifts
+   - **Workload detection validated** via mean-shift method
 
 ### Detection Methods
 
@@ -221,7 +231,7 @@ python3 experiments/exp27_ossicle_array_thermal.py
 | Bounded noise floor | ✓ **Works** | σ=0.0017 (Exp 31) |
 | Stochastic resonance | ✓ **Works** | SNR peak at σ=0.001 |
 | Fluctuation theorem | ✓ **Works** | R²=0.95, Crooks relation |
-| **Variance thermal sensing** | ✓ **Works** | r=-0.97 with GPU temperature |
+| Variance thermal sensing | ✗ **NOT VALIDATED** | r=-0.97 not reproducible, random peaks |
 | **r_ab sensitivity regime** | ✓ **Works** | r=-0.999 predicts sensitivity |
 | **Coupling optimization** | ✓ **Works** | ε=0.003 optimal (τ=12.8s, 562x signal) |
 | **Array latency** | ✓ **Works** | 115x faster than VLA, 0.1ms min event (Exp 28) |
@@ -238,12 +248,14 @@ python3 experiments/exp27_ossicle_array_thermal.py
 | **CCA k_eff formula** | ✓ **Works** | k_eff = k/(1+ρ(k-1)), R² = 0.798, n=21 (Exp C1) |
 | **Propagation velocity** | ✓ **Works** | 0.5 ± 0.4 m/s thermal regime (Exp C2) |
 | **Leading indicators** | ✓ **Works** | spatial_variance ↑ before collapse (Exp C4) |
-| **60 Hz EMI detection** | ✓ **Works** | 18.7 dB SNR with bandpass, 7 subharmonics (Exp E1) |
-| **Cross-sensor coherence** | ✓ **Works** | 0.88 at 1 Hz, 0.34 at 60 Hz (Exp E1) |
+| 60 Hz EMI detection | ✗ **NOT VALIDATED** | Peaks inconsistent across runs, likely noise |
+| Cross-sensor coherence | ✗ **NOT VALIDATED** | Frequency peaks not reproducible |
 | **Δρ early warning** | ✓ **Works** | Δρ = 0.317 ± 0.125, 95% CI excludes 0 (Exp E2) |
 | **Collapse threshold** | ✓ **Works** | k_eff_critical = 4.0, latency 2.3x at collapse (Exp E4) |
 | **Block structure resilience** | ✓ **Works** | ρ_intra > ρ_inter preserves k_eff (Exp E1) |
 | **Velocity = non-thermal** | ✓ **Works** | 0.5 m/s = 50x thermal (0.01 m/s), PDN/scheduler (Exp E3) |
+| Velocity mechanism | ✗ **INCONCLUSIVE** | No model fits (R² < 0.02), β = 0.13 (Exp F1) |
+| ρ → fragility causality | ✗ **INCONCLUSIVE** | Intervention failed, sync decreased ρ (Exp F2) |
 | k_eff thermal sensing | ✗ **NOT VALIDATED** | r=0.01 (no correlation) |
 | Cross-device sensing | ✗ **NOT VALIDATED** | Algorithmic artifact (see below) |
 | Cross-device transmission | ✗ **NOT VALIDATED** | Startup transient artifact |

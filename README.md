@@ -3,38 +3,42 @@
 > **⚠️ EXPERIMENTAL / RESEARCH-GRADE SOFTWARE**
 > This is early-stage research code. Results are preliminary and require independent validation.
 
-**A coherence receiver that detects electromagnetic interference patterns through massive arrays of coupled oscillators on GPUs.**
+**Massive arrays of coupled oscillators on GPUs for workload detection.**
 
 [![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-blue.svg)](LICENSE)
 [![Status: Experimental](https://img.shields.io/badge/Status-Experimental-orange.svg)]()
 
 ## What is This?
 
-CIRISArray extends single-point [CIRISOssicle](https://github.com/CIRISAI/CIRISOssicle) sensors to **spatial wave imaging** and **environmental coherence sensing**. We discovered the system functions as a **coherence receiver** - detecting shared electromagnetic interference patterns across physically separated GPUs.
+CIRISArray extends single-point [CIRISOssicle](https://github.com/CIRISAI/CIRISOssicle) sensors to arrays for **GPU workload detection**.
 
 ```
-          Power Grid (60 Hz)
-                │
-                ▼
-          ┌─────────────┐
-          │ 1.09 Hz EMI │ ← 60 Hz ÷ 55 (subharmonic)
-          │   Carrier   │
-          └─────────────┘
-             /      \
-            ▼        ▼
-        ┌──────┐  ┌──────┐
-        │ 4090 │  │Jetson│   100% coherence during
-        └──────┘  └──────┘   peak sensitivity window
+                VALIDATED (January 2026)
+    ┌─────────────────────────────────────────────────┐
+    │     GPU Workload Detection (mean-shift method)  │
+    │     - 1% workload: +83% mean shift              │
+    │     - 50% workload: +2519% mean shift           │
+    │     - Detection latency: 1.3 ms                 │
+    └─────────────────────────────────────────────────┘
+
+            NOT VALIDATED (theorized only)
+    ┌─────────────────────────────────────────────────┐
+    │     - EMI/Temperature/VFD detection             │
+    │     - Cross-device coherence                    │
+    │     - Frequency peaks inconsistent across runs  │
+    └─────────────────────────────────────────────────┘
 ```
 
-## Key Discoveries (January 2026)
+## Key Findings (January 2026)
 
-| Finding | Result |
-|---------|--------|
-| **EMI Carrier** | 1.09 Hz (60 Hz ÷ 55 power line subharmonic) |
-| **Cross-Device Coherence** | 100% during 0-30s window |
-| **4:1 Negentropy Asymmetry** | Ordered signals: +19σ, disordered: -5σ |
-| **Thermalization Time** | τ = 46.1 ± 2.5 seconds |
+| Finding | Status | Result |
+|---------|--------|--------|
+| **Workload Detection** | ✓ VALIDATED | Mean-shift method, 1.3ms latency |
+| **GPU Timing TRNG** | ✓ VALIDATED | 120 kbps true entropy |
+| **Thermalization Time** | ✓ VALIDATED | τ = 46.1 ± 2.5 seconds |
+| EMI Detection | ✗ NOT VALIDATED | Frequency peaks not reproducible |
+| Temperature Sensing | ✗ NOT VALIDATED | Results inconsistent |
+| Cross-Device Coherence | ✗ NOT VALIDATED | Was algorithmic artifact |
 
 ## Physics Validation
 
@@ -99,22 +103,21 @@ python experiments/exp52_fluctuation_theorem.py \
   ★★★ FLUCTUATION THEOREM CONFIRMED ★★★
 ```
 
-### Cross-Device Coherence Test
+### Cross-Device Coherence Test (NOT VALIDATED)
 
-Requires two CUDA devices (tested: RTX 4090 + Jetson Orin):
+> **Warning:** Earlier claims of cross-device coherence were determined to be
+> **algorithmic artifacts** (see CLAUDE.md "Root Cause Analysis"). The correlation
+> came from the k_eff algorithm itself, not external signal coupling.
+
+The experiments below are preserved for reference but results should not be trusted:
 
 ```bash
-# On device 1 (transmitter)
+# These experiments produced false positives due to algorithmic artifacts
 python experiments/exp50_powerline_modulation.py --mode transmit --bits 11110000 -o tx.npz
-
-# On device 2 (receiver) - start within 2 seconds
 python experiments/exp50_powerline_modulation.py --mode receive --duration 30 -o rx.npz
-
-# Analyze
-python experiments/exp50_powerline_modulation.py --mode analyze --tx-file tx.npz --rx-file rx.npz
 ```
 
-**Note:** Cross-device *transmission* was NOT achieved. Both GPUs are passive *receivers* of shared grid EMI.
+**Status:** FALSIFIED - No cross-device coupling detected in controlled A/B tests.
 
 ## Optimal Operating Parameters
 
@@ -168,14 +171,16 @@ CIRISArray/
 
 ## Hypotheses Under Investigation
 
-### Coherence Detection Hypothesis
-The instrument measures *how ordered* a signal is, not *how strong*:
-- Negentropic (ordered) signals: +19σ response
-- Entropic (disordered) signals: -5σ response
-- The detector is literally tuned to prefer order via stochastic resonance
+### Coherence Detection Hypothesis - NOT VALIDATED
+Earlier claims that the instrument measures "coherence" or "order" were based on
+experiments that produced non-reproducible frequency peaks. The only validated
+capability is **workload detection** via mean-shift method.
 
-### Human Sensitivity Hypothesis
-If biological neural networks also exhibit stochastic resonance, humans might unconsciously detect coherence patterns. **Untested** - requires EEG equipment and IRB approval.
+### Human Sensitivity Hypothesis - UNTESTED
+If biological neural networks also exhibit stochastic resonance, humans might
+unconsciously detect coherence patterns. **Untested** - requires EEG equipment
+and IRB approval. Note: This hypothesis depends on coherence detection which
+itself is not validated.
 
 ## Research Notes
 
@@ -183,7 +188,7 @@ If biological neural networks also exhibit stochastic resonance, humans might un
 
 **τ = 46 seconds:** The thermalization time constant explains why sensitivity peaks in the first 20-30 seconds after reset. Optimal reset interval is τ/2 ≈ 23 seconds.
 
-**House Wiring as Sensor:** The propagation delay observation (-3.3° phase) proves the signal has an external source. House wiring (~300m copper) acts as a distributed coherence antenna.
+**House Wiring as Sensor:** ~~The propagation delay observation (-3.3° phase) proves the signal has an external source.~~ **NOT VALIDATED** - This hypothesis was based on cross-device correlations that turned out to be algorithmic artifacts.
 
 ## License
 
@@ -205,11 +210,11 @@ Licensor: CIRIS L3C (Eric Moore)
 ```bibtex
 @software{cirisarray,
   author = {Moore, Eric},
-  title = {CIRISArray: Coherence Receiver via GPU Oscillator Arrays},
+  title = {CIRISArray: GPU Workload Detection via Oscillator Arrays},
   year = {2026},
   publisher = {CIRIS L3C},
   url = {https://github.com/CIRISAI/CIRISArray},
-  note = {Stochastic resonance, fluctuation theorem verified},
+  note = {Workload detection validated; EMI/thermal detection NOT validated},
   license = {BSL-1.1}
 }
 ```
